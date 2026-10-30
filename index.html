@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>pumpkin.js</title>
+  </head>
+  <body></body>
+  <script>
+    const body = document.querySelector("body");
+    body.style.backgroundColor = "black";
+    const starCount = 100;
+
+    // Stars
+    for (let i = 0; i < starCount; i++) {
+      const star = document.createElement("div");
+      const starSize = Math.random() * 10;
+      const starX = Math.random() * 100;
+      const starY = Math.random() * 100;
+      star.style.transform = `translateX(${starX}%) translateY(${starY})`;
+      star.backgroundColor = "white";
+      star.style.width = `${starSize}px`;
+      star.style.height = `${starSize}px`;
+      body.appendChild(star);
+    }
+
+    const pumpkin = document.createElement("div");
+
+    body.appendChild(pumpkin);
+  </script>
+</html>
