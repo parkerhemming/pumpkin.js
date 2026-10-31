@@ -4467,6 +4467,7 @@
 					uFlicker: { value: 1 },
 					uScratch: { value: new THREE.Vector2(0.5, 0) }, // x position, strength (0 = none)
 					uWeave: { value: new THREE.Vector2() },
+					uPixelRatio: { value: 1 }, // render pixels per CSS pixel
 				},
 				vertexShader: fullscreenVertex,
 				fragmentShader: `
@@ -4476,6 +4477,7 @@
 					uniform float uFlicker;
 					uniform vec2 uScratch;
 					uniform vec2 uWeave;
+					uniform float uPixelRatio;
 					varying vec2 vUv;
 
 					float hash(vec2 p) {
@@ -4499,9 +4501,11 @@
 						vec2 q = vUv - 0.5;
 						q.x *= uResolution.x / uResolution.y;
 						c *= mix(0.45, 1.0, 1.0 - smoothstep(0.2, 0.95, length(q)));
-						// Heavy grain in clumps a couple of pixels wide, strongest in the mid-tones.
-						vec2 pixel = floor(gl_FragCoord.xy);
-						float grain = (hash(floor(pixel / 2.0) + uSeed) - 0.5) + 0.5 * (hash(pixel + uSeed * 1.37) - 0.5);
+						// Heavy grain, strongest in the mid-tones. Sized in CSS pixels (clumps
+						// about 1.5 across) so it looks the same on every screen, whatever
+						// resolution the scene is rendering at.
+						vec2 css = gl_FragCoord.xy / uPixelRatio;
+						float grain = (hash(floor(css / 1.5) + uSeed) - 0.5) + 0.5 * (hash(floor(css) + uSeed * 1.37) - 0.5);
 						float mid = 1.0 - min(1.0, abs(l - 0.4) * 1.5);
 						c += grain * 0.12 * (0.45 + 0.55 * mid);
 						// Dust: a few specks, different every frame, dark and light.
@@ -4515,7 +4519,7 @@
 						// A scratch running down the frame, broken in places.
 						if (uScratch.y > 0.0) {
 							float x = uScratch.x + 0.002 * sin(vUv.y * 23.0 + uSeed) + 0.001 * sin(vUv.y * 71.0);
-							float line = 1.0 - smoothstep(0.0, 1.5 / uResolution.x, abs(vUv.x - x));
+							float line = 1.0 - smoothstep(0.0, 1.5 * uPixelRatio / uResolution.x, abs(vUv.x - x)); // 1.5 CSS pixels wide
 							float unbroken = step(0.25, hash(vec2(floor(vUv.y * 90.0), uSeed)));
 							c = mix(c, vec3(0.82, 0.8, 0.74), line * unbroken * uScratch.y * 0.55);
 						}
@@ -5786,12 +5790,13 @@
 			// =====================================================================
 
 			const hint = document.createElement("div");
-			hint.textContent = "drag to look around · scroll or pinch to move in · drag things on the table · click or tap a flame";
+			hint.textContent =
+				innerWidth < 600 ? "drag to look · pinch to move in · tap a flame" : "drag to look around · scroll or pinch to move in · drag things on the table · click or tap a flame";
 			Object.assign(hint.style, {
 				position: "fixed",
 				bottom: "14px",
-				left: "0",
-				right: "0",
+				left: "120px", // clear of the frame rate and the maker's mark in the corners
+				right: "120px",
 				textAlign: "center",
 				pointerEvents: "none",
 				color: "#c9b9a0",
@@ -5801,6 +5806,103 @@
 			});
 			document.body.appendChild(hint);
 			setTimeout(() => (hint.style.opacity = "0"), 7000);
+
+			// =====================================================================
+			// Maker's mark and frame rate
+			// The mark from the footer of hemm.ing (as in closer-to-christ), linking
+			// to Parker Hemming's portfolio, bottom right. A faint frame rate,
+			// bottom left.
+			// =====================================================================
+
+			const allura = document.createElement("link"); // just the two letters of the "an"
+			allura.rel = "stylesheet";
+			allura.href = "https://fonts.googleapis.com/css2?family=Allura&text=an&display=swap";
+			document.head.appendChild(allura);
+
+			const cornerStyles = document.createElement("style");
+			cornerStyles.textContent = `
+				.maker-mark {
+					position: fixed;
+					right: max(18px, env(safe-area-inset-right));
+					bottom: max(12px, env(safe-area-inset-bottom));
+					display: inline-block;
+					text-decoration: none;
+					opacity: 0.4;
+					transition: opacity 0.2s;
+				}
+				.maker-mark:hover,
+				.maker-mark:focus-visible {
+					opacity: 0.8;
+				}
+				/* The symbols sit in its top padding, inside its box. */
+				.maker-mark__text {
+					position: relative;
+					display: block;
+					padding-top: 14px;
+					color: #f6f6f6;
+					font: 300 18px/1 "Times New Roman", serif;
+					letter-spacing: 0.1px;
+					text-align: center;
+					opacity: 0.6;
+					transform: scaleX(1.15) scaleY(0.9);
+				}
+				.maker-mark__symbols {
+					position: absolute;
+					top: 0;
+					left: 50%;
+					display: flex;
+					gap: 4px;
+					align-items: center;
+					justify-content: center;
+					font: 200 9px/9px Arial, Helvetica, sans-serif;
+					opacity: 0.5;
+					transform: translateX(-50%) scaleY(1.1);
+				}
+				.maker-mark__an {
+					display: inline-block;
+					font: italic 400 14px "Allura", cursive;
+					transform: scaleX(1) scaleY(1.5) translateY(-1px) rotate(-2.25deg);
+				}
+				.frame-rate {
+					position: fixed;
+					left: max(16px, env(safe-area-inset-left));
+					bottom: max(14px, env(safe-area-inset-bottom));
+					color: #e8d8bf;
+					font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+					letter-spacing: 0.5px;
+					opacity: 0.35;
+					pointer-events: none;
+				}
+			`;
+			document.head.appendChild(cornerStyles);
+
+			const mark = document.createElement("a");
+			mark.className = "maker-mark";
+			mark.href = "https://hemm.ing";
+			mark.target = "_blank";
+			mark.rel = "noopener";
+			mark.setAttribute("aria-label", "Hemming, an LLC: Parker Hemming's portfolio");
+			mark.innerHTML = `
+				<span class="maker-mark__text">
+					<span class="maker-mark__symbols" aria-hidden="true"><span>®</span><span>©</span><span>℗</span><span>™</span></span>
+					HEMMING<br /><span class="maker-mark__an">an</span> LLC
+				</span>
+			`;
+			document.body.appendChild(mark);
+
+			const frameRate = document.createElement("div");
+			frameRate.className = "frame-rate";
+			frameRate.setAttribute("aria-hidden", "true");
+			document.body.appendChild(frameRate);
+			const frames = { count: 0, time: 0 };
+			function updateFrameRate(rawDt) {
+				frames.count++;
+				frames.time += rawDt;
+				if (frames.time < 0.5) return; // twice a second, so it's readable
+				frameRate.textContent = `${Math.round(frames.count / frames.time)} fps`;
+				frames.count = 0;
+				frames.time = 0;
+			}
 
 			// =====================================================================
 			// Animation
@@ -5821,6 +5923,7 @@
 			function animate() {
 				const rawDt = clock.getDelta();
 				const dt = Math.min(rawDt, 0.05);
+				updateFrameRate(rawDt);
 				const t = clock.elapsedTime;
 
 				if (Math.random() < dt * 0.25) {
@@ -5893,6 +5996,7 @@
 				composer.setPixelRatio(renderer.getPixelRatio());
 				composer.setSize(width, height);
 				grade.uniforms.uResolution.value.set(width * renderer.getPixelRatio(), height * renderer.getPixelRatio());
+				grade.uniforms.uPixelRatio.value = renderer.getPixelRatio();
 				// Smoke particles size themselves in world units.
 				pointScale.value = (height * renderer.getPixelRatio()) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
 			}
