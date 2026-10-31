@@ -20,6 +20,11 @@
 			import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 			import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 			import RAPIER from "rapier";
+			import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+			import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+			import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+			import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+			import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
 
 			const TAU = Math.PI * 2;
 			const clamp = (x, min, max) => Math.min(max, Math.max(min, x));
@@ -119,18 +124,20 @@
 
 			// =====================================================================
 			// Settings
-			// No on-screen controls. The URL can still pick a pumpkin:
-			// #seed=777&face=spooky (faces: classic, goofy, spooky, surprised).
+			// Every load is a new seed: a new pumpkin, face, and jump-scare
+			// creature. A link with #seed=777 (and optionally &face=spooky) loads
+			// that one once; the address is then cleared so a refresh is new again.
 			// =====================================================================
 
 			const FACE_NAMES = ["classic", "goofy", "spooky", "surprised"];
 			const hashParams = new URLSearchParams(location.hash.slice(1));
+			const seed = parseInt(hashParams.get("seed")) || Math.floor(Math.random() * 1e9) + 1;
 			const settings = {
-				seed: parseInt(hashParams.get("seed") ?? location.hash.slice(1)) || Math.floor(Math.random() * 1e9) + 1,
-				face: FACE_NAMES.includes(hashParams.get("face")) ? hashParams.get("face") : "classic",
+				seed,
+				face: FACE_NAMES.includes(hashParams.get("face")) ? hashParams.get("face") : FACE_NAMES[Math.floor(mulberry32(seed + 21)() * FACE_NAMES.length)],
 				candleLit: true,
 			};
-			history.replaceState(null, "", `#seed=${settings.seed}&face=${settings.face}`);
+			if (location.hash) history.replaceState(null, "", location.pathname + location.search);
 
 			// =====================================================================
 			// Renderer, camera, controls
@@ -143,7 +150,7 @@
 			renderer.shadowMap.enabled = true;
 			renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 			renderer.toneMapping = THREE.NeutralToneMapping;
-			renderer.toneMappingExposure = 1.1;
+			renderer.toneMappingExposure = 1.25;
 			// Fixed to the viewport so the canvas can never widen the page on phones.
 			Object.assign(renderer.domElement.style, { position: "fixed", inset: "0", width: "100%", height: "100%" });
 			document.body.appendChild(renderer.domElement);
@@ -1164,14 +1171,14 @@
 						// Teardrop: round bottom, pointed top.
 						float width = y < 0.25
 							? sqrt(max(0.0, 1.0 - pow((0.25 - y) / 0.25, 2.0)))
-							: pow(1.0 - (y - 0.25) / 0.75, 1.3);
+							: pow(max(1.0 - (y - 0.25) / 0.75, 0.0), 1.3);
 						float d = abs(x) / max(width * 0.9, 0.001);
 
 						float body = smoothstep(1.0, 0.5, d) * mix(0.45, 1.0, smoothstep(0.04, 0.2, y));
 						float core = smoothstep(0.7, 0.0, d) * smoothstep(0.75, 0.2, y);
 						vec3 color = mix(vec3(1.0, 0.5, 0.12), vec3(1.0, 0.9, 0.6), core);
 						color = mix(vec3(0.3, 0.4, 1.0), color, smoothstep(0.03, 0.18, y));
-						gl_FragColor = vec4(color, body);
+						gl_FragColor = vec4(pow(color, vec3(2.2)) * 2.5, body); // linear, and bright enough to bloom
 					}
 				`,
 			});
@@ -1570,12 +1577,14 @@
 			ground.receiveShadow = true;
 			scene.add(ground);
 
+			const skyTime = { value: 0 };
 			scene.add(
 				new THREE.Mesh(
 					new THREE.SphereGeometry(300, 32, 16),
 					new THREE.ShaderMaterial({
 						side: THREE.BackSide,
 						depthWrite: false,
+						uniforms: { uTime: skyTime },
 						vertexShader: `
 							varying vec3 vDirection;
 							void main() {
@@ -1584,12 +1593,46 @@
 							}
 						`,
 						fragmentShader: `
+							uniform float uTime;
 							varying vec3 vDirection;
+
+							float hash(vec2 p) {
+								return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+							}
+							float noise(vec2 p) {
+								vec2 i = floor(p);
+								vec2 f = fract(p);
+								f = f * f * (3.0 - 2.0 * f);
+								return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+							}
+							float fbm(vec2 p) {
+								float value = 0.0;
+								float amplitude = 0.5;
+								for (int i = 0; i < 5; i++) {
+									value += amplitude * noise(p);
+									p *= 2.03;
+									amplitude *= 0.5;
+								}
+								return value;
+							}
+
 							void main() {
-								float h = vDirection.y;
-								vec3 color = mix(vec3(0.1, 0.12, 0.17), vec3(0.008, 0.01, 0.03), smoothstep(-0.02, 0.45, h));
+								vec3 dir = normalize(vDirection);
+								float h = dir.y;
+								vec3 color = mix(vec3(0.11, 0.1, 0.17), vec3(0.012, 0.008, 0.035), smoothstep(-0.02, 0.45, h));
+								// A violet glow low in the sky: muted behind the scene, deepening to a
+								// vivid purple toward the sides and behind the camera.
+								float towardCamera = smoothstep(-0.85, 0.75, dir.z);
+								float low = exp(-max(h, 0.0) * 6.0) * smoothstep(-0.1, 0.02, h);
+								vec3 violet = mix(vec3(0.16, 0.12, 0.22), vec3(0.38, 0.09, 0.52), towardCamera);
+								color = mix(color, violet, low * (0.3 + 0.55 * towardCamera));
+								// Thin clouds drifting across, lit purple, paler near the moon.
+								float c = fbm(dir.xz / (max(h, 0.0) + 0.12) * 0.9 + vec2(uTime * 0.004, 0.0));
+								float clouds = smoothstep(0.45, 0.8, c) * smoothstep(-0.02, 0.1, h) * (1.0 - smoothstep(0.45, 0.9, h));
+								float nearMoon = pow(max(dot(dir, vec3(-0.338, 0.089, -0.937)), 0.0), 8.0);
+								color = mix(color, mix(mix(vec3(0.15, 0.1, 0.2), vec3(0.3, 0.09, 0.4), towardCamera), vec3(0.6, 0.45, 0.52), nearMoon), clouds * (0.35 + 0.35 * towardCamera));
 								color *= smoothstep(-0.5, 0.0, h) * 0.8 + 0.2;
-								gl_FragColor = vec4(color, 1.0);
+								gl_FragColor = vec4(pow(color, vec3(2.2)), 1.0);
 							}
 						`,
 					}),
@@ -1632,7 +1675,7 @@
 					varying float vTwinkle;
 					void main() {
 						float a = smoothstep(0.5, 0.1, length(gl_PointCoord - 0.5)) * vTwinkle;
-						gl_FragColor = vec4(1.0, 0.97, 0.9, a);
+						gl_FragColor = vec4(vec3(1.0, 0.95, 0.85) * 1.3, a);
 					}
 				`,
 			});
@@ -1823,6 +1866,7 @@
 				entry.on = false;
 				if (entry === pumpkinFlame) settings.candleLit = false;
 				smokeEmitters.push({ flame: entry, age: 0, carry: 0 });
+				sounds.puff(entry.mesh.getWorldPosition(new THREE.Vector3()));
 			}
 
 			const pumpkinFlameTarget = clickTarget(0.06);
@@ -1954,105 +1998,366 @@
 
 			// =====================================================================
 			// Skull (right). Click it and its jaw chatters.
+			// Sculpted as a distance field (negative inside): ellipsoids and
+			// capsules smoothly joined, then carved for the eye sockets, the nasal
+			// opening and the hollow temples under the cheekbone arches, and
+			// meshed. Units: the skull is about 1 long, +z is the face.
 			// =====================================================================
 
-			function buildSkull() {
-				const geometry = new THREE.SphereGeometry(1, 96, 72);
-				const position = geometry.attributes.position;
+			const smin = (a, b, k) => {
+				const h = clamp(0.5 + (0.5 * (b - a)) / k, 0, 1);
+				return b + (a - b) * h - k * h * (1 - h);
+			};
+			const smax = (a, b, k) => -smin(-a, -b, k);
+
+			function sdEllipsoid(x, y, z, rx, ry, rz) {
+				const k0 = Math.hypot(x / rx, y / ry, z / rz);
+				const k1 = Math.hypot(x / (rx * rx), y / (ry * ry), z / (rz * rz));
+				return k1 === 0 ? -Math.min(rx, ry, rz) : (k0 * (k0 - 1)) / k1;
+			}
+
+			function sdCapsule(x, y, z, ax, ay, az, bx, by, bz, r) {
+				const px = x - ax;
+				const py = y - ay;
+				const pz = z - az;
+				const dx = bx - ax;
+				const dy = by - ay;
+				const dz = bz - az;
+				const h = clamp((px * dx + py * dy + pz * dz) / (dx * dx + dy * dy + dz * dz), 0, 1);
+				return Math.hypot(px - dx * h, py - dy * h, pz - dz * h) - r;
+			}
+
+			// Bone isn't smooth: a faint, irregular lumpiness.
+			const lumpy = (x, y, z) => 0.003 * Math.sin(x * 41 + y * 13) * Math.sin(y * 37 - z * 17) * Math.sin(z * 29 + x * 7);
+
+			// The dental arch, as [x, z] from the front teeth back (mirrored for the left).
+			const dentalArch = [
+				[0, 0.45],
+				[0.058, 0.43],
+				[0.108, 0.37],
+				[0.14, 0.28],
+				[0.15, 0.2],
+			];
+
+			function craniumField(x, y, z) {
+				const ax = Math.abs(x);
+				let d = sdEllipsoid(x, y - 0.08, z + 0.06, 0.37, 0.35, 0.5); // braincase
+				d = smin(d, sdEllipsoid(x, y + 0.2, z - 0.28, 0.29, 0.26, 0.2), 0.08); // face
+				d = smin(d, sdEllipsoid(ax - 0.24, y + 0.17, z - 0.33, 0.075, 0.06, 0.07), 0.04); // cheekbones
+				d = smin(d, sdEllipsoid(x, y + 0.34, z - 0.33, 0.17, 0.075, 0.14), 0.05); // upper jaw
+				for (let i = 1; i < dentalArch.length; i++) {
+					// The ridge of bone the upper teeth sit in.
+					const [x0, z0] = dentalArch[i - 1];
+					const [x1, z1] = dentalArch[i];
+					d = smin(d, sdCapsule(ax, y, z, x0, -0.385, z0, x1, -0.385, z1, 0.026), 0.03);
+				}
+				d = smin(d, sdEllipsoid(ax - 0.27, y + 0.29, z + 0.08, 0.035, 0.06, 0.04), 0.03); // mastoids
+				d = smax(d, -sdEllipsoid(ax - 0.36, y + 0.1, z - 0.1, 0.075, 0.13, 0.16), 0.03); // temples
+				d = smin(d, sdCapsule(ax, y, z, 0.27, -0.18, 0.28, 0.34, -0.16, 0.0, 0.022), 0.02); // cheekbone arches
+				// Brow ridge, curving back with the forehead.
+				const brow = [
+					[0, 0.05, 0.445],
+					[0.1, 0.045, 0.43],
+					[0.2, 0.035, 0.37],
+					[0.26, 0.0, 0.3],
+				];
+				for (let i = 1; i < brow.length; i++) d = smin(d, sdCapsule(ax, y, z, ...brow[i - 1], ...brow[i], 0.022), 0.04);
+				const socket = sdEllipsoid(ax - 0.17, y + 0.05 + (ax - 0.17) * 0.18, z - 0.42, 0.1, 0.085, 0.2);
+				d = smax(d, -socket, 0.02);
+				const nose = smin(sdEllipsoid(x, y + 0.24, z - 0.46, 0.055, 0.06, 0.15), sdEllipsoid(x, y + 0.17, z - 0.47, 0.03, 0.05, 0.12), 0.03);
+				d = smax(d, -nose, 0.015);
+				d = smax(d, -sdEllipsoid(ax - 0.12, y + 0.27, z - 0.5, 0.05, 0.05, 0.05), 0.03); // hollows beside the nose
+				return d + lumpy(x, y, z);
+			}
+
+			const JAW_HINGE = new THREE.Vector3(0, -0.29, -0.04);
+
+			function jawField(x, y, z) {
+				const ax = Math.abs(x);
+				// The body follows the arch, then runs back to the angle of the jaw.
+				// Squashing y makes its cross-section taller than it is thick.
+				const tall = -0.5 + (y + 0.5) * 0.55;
+				const path = [...dentalArch.slice(0, 4), [0.2, 0.16], [0.25, 0.04]];
+				let d = 1;
+				for (let i = 1; i < path.length; i++) {
+					const [x0, z0] = path[i - 1];
+					const [x1, z1] = path[i];
+					d = smin(d, sdCapsule(ax, tall, z, x0, -0.5, z0, x1, -0.5, z1, 0.026), 0.02);
+				}
+				d = smin(d, sdCapsule(ax, y, z, 0.25, -0.48, 0.04, 0.27, -0.3, -0.04, 0.03), 0.03); // up to the hinge
+				d = smin(d, sdCapsule(ax, y, z, 0.245, -0.45, 0.08, 0.23, -0.32, 0.1, 0.02), 0.03); // coronoid point
+				d = smin(d, sdEllipsoid(x, y + 0.535, z - 0.45, 0.05, 0.035, 0.025), 0.02); // chin
+				return d + lumpy(x, y, z);
+			}
+
+			// Meshes the zero surface of a distance field with surface nets: one
+			// vertex per grid cell the surface passes through (the average of where
+			// it crosses that cell's edges), one quad per grid edge it crosses.
+			// Normals come from the field's gradient; the color darkens with how
+			// enclosed each point is (ambient occlusion sampled from the field).
+			function meshField(field, [x0, y0, z0], [x1, y1, z1], step, colorAt) {
+				const nx = Math.ceil((x1 - x0) / step) + 1;
+				const ny = Math.ceil((y1 - y0) / step) + 1;
+				const nz = Math.ceil((z1 - z0) / step) + 1;
+				const at = (i, j, k) => i + nx * (j + ny * k);
+				const values = new Float32Array(nx * ny * nz);
+				for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) values[at(i, j, k)] = field(x0 + i * step, y0 + j * step, z0 + k * step);
+
+				const corners = [
+					[0, 0, 0],
+					[1, 0, 0],
+					[0, 1, 0],
+					[1, 1, 0],
+					[0, 0, 1],
+					[1, 0, 1],
+					[0, 1, 1],
+					[1, 1, 1],
+				];
+				const edges = [
+					[0, 1],
+					[2, 3],
+					[4, 5],
+					[6, 7],
+					[0, 2],
+					[1, 3],
+					[4, 6],
+					[5, 7],
+					[0, 4],
+					[1, 5],
+					[2, 6],
+					[3, 7],
+				];
+				const cellAt = (i, j, k) => i + (nx - 1) * (j + (ny - 1) * k);
+				const cellVertex = new Int32Array((nx - 1) * (ny - 1) * (nz - 1)).fill(-1);
+				const positions = [];
+				const v = new Float32Array(8);
+				for (let k = 0; k < nz - 1; k++) {
+					for (let j = 0; j < ny - 1; j++) {
+						for (let i = 0; i < nx - 1; i++) {
+							let inside = 0;
+							for (let c = 0; c < 8; c++) {
+								v[c] = values[at(i + corners[c][0], j + corners[c][1], k + corners[c][2])];
+								if (v[c] < 0) inside++;
+							}
+							if (inside === 0 || inside === 8) continue;
+							let sx = 0;
+							let sy = 0;
+							let sz = 0;
+							let count = 0;
+							for (const [e0, e1] of edges) {
+								if (v[e0] < 0 === v[e1] < 0) continue;
+								const t = v[e0] / (v[e0] - v[e1]);
+								sx += corners[e0][0] + (corners[e1][0] - corners[e0][0]) * t;
+								sy += corners[e0][1] + (corners[e1][1] - corners[e0][1]) * t;
+								sz += corners[e0][2] + (corners[e1][2] - corners[e0][2]) * t;
+								count++;
+							}
+							cellVertex[cellAt(i, j, k)] = positions.length / 3;
+							positions.push(x0 + (i + sx / count) * step, y0 + (j + sy / count) * step, z0 + (k + sz / count) * step);
+						}
+					}
+				}
+
+				// Each crossed edge joins the four cells around it. Winding faces the
+				// quad out of the solid.
+				const index = [];
+				const quad = (a, b, c, d, outward) => {
+					if (a < 0 || b < 0 || c < 0 || d < 0) return;
+					if (outward) index.push(a, b, c, a, c, d);
+					else index.push(a, c, b, a, d, c);
+				};
+				for (let k = 1; k < nz - 1; k++) {
+					for (let j = 1; j < ny - 1; j++) {
+						for (let i = 1; i < nx - 1; i++) {
+							const here = values[at(i, j, k)] < 0;
+							if (here !== values[at(i + 1, j, k)] < 0) {
+								quad(cellVertex[cellAt(i, j - 1, k - 1)], cellVertex[cellAt(i, j, k - 1)], cellVertex[cellAt(i, j, k)], cellVertex[cellAt(i, j - 1, k)], here);
+							}
+							if (here !== values[at(i, j + 1, k)] < 0) {
+								quad(cellVertex[cellAt(i - 1, j, k - 1)], cellVertex[cellAt(i - 1, j, k)], cellVertex[cellAt(i, j, k)], cellVertex[cellAt(i, j, k - 1)], here);
+							}
+							if (here !== values[at(i, j, k + 1)] < 0) {
+								quad(cellVertex[cellAt(i - 1, j - 1, k)], cellVertex[cellAt(i, j - 1, k)], cellVertex[cellAt(i, j, k)], cellVertex[cellAt(i - 1, j, k)], here);
+							}
+						}
+					}
+				}
+
+				const normals = [];
 				const colors = [];
-				const bone = new THREE.Color("#c9b994");
-				const dirt = new THREE.Color("#6e5a3c");
-				const dark = new THREE.Color("#1e1712");
+				const e = step * 0.5;
+				const normal = new THREE.Vector3();
 				const color = new THREE.Color();
-				const p = new THREE.Vector3();
-
-				for (let i = 0; i < position.count; i++) {
-					p.fromBufferAttribute(position, i); // unit sphere, +z is the face
-					let x = p.x * 0.8;
-					let y = p.y * 0.88;
-					let z = p.z;
-					const face = smoothstep(0.15, 0.75, p.z) * smoothstep(0.25, -0.35, p.y);
-					const low = smoothstep(-0.3, -0.9, p.y);
-					x *= 1 - 0.22 * face - 0.3 * low;
-					z = z * (1 - 0.3 * low) + 0.12 * low * smoothstep(-0.2, 0.6, p.z);
-					y += 0.12 * low * smoothstep(0.5, -0.5, p.z);
-
-					// Deep orbits with sharp upper rims, a nasal hole, cheekbones that
-					// stand out, sunken temples, and a heavy brow.
-					const sockets = bump(p, 0.33, -0.04, 0.9, 0.2) + bump(p, -0.33, -0.04, 0.9, 0.2);
-					const nose = bump(p, 0, -0.33, 0.94, 0.11) * smoothstep(-0.55, -0.22, p.y) + 0.6 * bump(p, 0, -0.42, 0.9, 0.08);
-					const cheeks = bump(p, 0.52, -0.3, 0.7, 0.14) + bump(p, -0.52, -0.3, 0.7, 0.14);
-					const arches = bump(p, 0.78, -0.22, 0.35, 0.16) + bump(p, -0.78, -0.22, 0.35, 0.16);
-					const temples = bump(p, 0.8, 0.12, 0.35, 0.22) + bump(p, -0.8, 0.12, 0.35, 0.22);
-					const brow = bump(p, 0.3, 0.17, 0.93, 0.1) + bump(p, -0.3, 0.17, 0.93, 0.1) + 0.6 * bump(p, 0, 0.16, 0.98, 0.12);
-					const underCheek = bump(p, 0.45, -0.52, 0.55, 0.16) + bump(p, -0.45, -0.52, 0.55, 0.16);
-					const k = 1 - 0.55 * sockets - 0.4 * nose + 0.09 * cheeks + 0.06 * arches - 0.1 * temples + 0.07 * brow - 0.08 * underCheek;
-					position.setXYZ(i, x * k, y * k, z * k);
-
-					const cavity = clamp(sockets * 1.5 + nose * 1.8 + underCheek * 0.4 + temples * 0.25, 0, 1);
-					color
-						.copy(bone)
-						.lerp(dirt, 0.45 * woodNoise(p.x * 6 + 900, p.y * 6 + p.z * 4) + 0.25 * low + 0.2 * (1 - p.y) * 0.5)
-						.lerp(dark, cavity * cavity);
+				for (let n = 0; n < positions.length; n += 3) {
+					const [x, y, z] = [positions[n], positions[n + 1], positions[n + 2]];
+					normal.set(field(x + e, y, z) - field(x - e, y, z), field(x, y + e, z) - field(x, y - e, z), field(x, y, z + e) - field(x, y, z - e)).normalize();
+					normals.push(normal.x, normal.y, normal.z);
+					let occlusion = 0;
+					for (let s = 1; s <= 4; s++) {
+						const reach = s * 0.025;
+						occlusion += (reach - field(x + normal.x * reach, y + normal.y * reach, z + normal.z * reach)) / 2 ** s;
+					}
+					colorAt(color, x, y, z, clamp(1 - occlusion * 12, 0.05, 1));
 					colors.push(color.r, color.g, color.b);
 				}
+
+				const geometry = new THREE.BufferGeometry();
+				geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+				geometry.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
 				geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
-				geometry.computeVertexNormals();
+				geometry.setIndex(index);
+				return geometry;
+			}
 
-				const boneMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8 });
-				const toothMaterial = new THREE.MeshStandardMaterial({ color: "#cbbb92", roughness: 0.55 });
-				const skull = new THREE.Group();
-				skull.add(new THREE.Mesh(geometry, boneMaterial));
-
-				const tooth = new THREE.BoxGeometry(0.06, 0.11, 0.05);
-				const teeth = (parent, y, radius, depth, flip) => {
-					for (let i = 0; i < 10; i++) {
-						const a = (i / 9 - 0.5) * 2.2;
-						const t = new THREE.Mesh(tooth, toothMaterial);
-						t.position.set(Math.sin(a) * radius, y + random(-0.01, 0.01), depth + Math.cos(a) * radius * 0.9);
-						t.rotation.y = a;
-						t.scale.y = flip * random(0.8, 1.1);
-						parent.add(t);
-					}
+			// Old bone: stains, pores, and the wiggly seams (sutures) where the
+			// plates of the skull meet, worked out per pixel from the position on
+			// the skull.
+			function agedBone(material) {
+				material.onBeforeCompile = (shader) => {
+					shader.vertexShader = shader.vertexShader
+						.replace("#include <common>", "#include <common>\nvarying vec3 vBone;")
+						.replace("#include <begin_vertex>", "#include <begin_vertex>\nvBone = position;");
+					shader.fragmentShader = shader.fragmentShader
+						.replace(
+							"#include <common>",
+							`#include <common>
+							varying vec3 vBone;
+							float boneHash(float n) {
+								return fract(sin(n) * 43758.5453);
+							}
+							float boneNoise(vec3 p) {
+								vec3 i = floor(p);
+								vec3 f = fract(p);
+								f = f * f * (3.0 - 2.0 * f);
+								float n = dot(i, vec3(1.0, 57.0, 113.0));
+								return mix(
+									mix(mix(boneHash(n), boneHash(n + 1.0), f.x), mix(boneHash(n + 57.0), boneHash(n + 58.0), f.x), f.y),
+									mix(mix(boneHash(n + 113.0), boneHash(n + 114.0), f.x), mix(boneHash(n + 170.0), boneHash(n + 171.0), f.x), f.y),
+									f.z
+								);
+							}
+							float seam(float distance) {
+								return 1.0 - smoothstep(0.0015, 0.0045, abs(distance));
+							}
+							// Bump the shading normal by a height field's screen-space slope
+							// (the same trick as three.js's bump maps, minus the texture).
+							vec3 boneBump(vec3 surfacePosition, vec3 surfaceNormal, vec2 slope, float faceDirection) {
+								vec3 sigmaX = normalize(dFdx(surfacePosition));
+								vec3 sigmaY = normalize(dFdy(surfacePosition));
+								vec3 r1 = cross(sigmaY, surfaceNormal);
+								vec3 r2 = cross(surfaceNormal, sigmaX);
+								float det = dot(sigmaX, r1) * faceDirection;
+								return normalize(abs(det) * surfaceNormal - sign(det) * (slope.x * r1 + slope.y * r2));
+							}`,
+						)
+						.replace(
+							"#include <color_fragment>",
+							`#include <color_fragment>
+							float stain = boneNoise(vBone * 7.0) * 0.65 + boneNoise(vBone * 19.0) * 0.35;
+							diffuseColor.rgb *= mix(vec3(1.0), vec3(0.72, 0.6, 0.45), smoothstep(0.55, 0.85, stain));
+							float pores = boneNoise(vBone * 210.0);
+							diffuseColor.rgb *= 1.0 - 0.18 * smoothstep(0.72, 0.92, pores);
+							float coronal = seam(vBone.z - (0.12 - 0.35 * vBone.x * vBone.x) - 0.006 * sin(vBone.x * 160.0) - 0.004 * sin(vBone.x * 330.0 + 1.0)) * step(0.0, vBone.y);
+							float sagittal = seam(vBone.x - 0.006 * sin(vBone.z * 150.0) - 0.004 * sin(vBone.z * 310.0)) * step(0.3, vBone.y) * step(vBone.z, 0.12) * step(-0.5, vBone.z);
+							float lambdoid = seam(vBone.y - (0.32 - 0.9 * abs(vBone.x)) - 0.006 * sin(vBone.x * 150.0 + 2.0)) * step(vBone.z, -0.32);
+							diffuseColor.rgb *= 1.0 - 0.6 * clamp(coronal + sagittal + lambdoid, 0.0, 1.0);`,
+						)
+						.replace(
+							"#include <normal_fragment_maps>",
+							`#include <normal_fragment_maps>
+							float pits = boneNoise(vBone * 95.0) * 0.6 + boneNoise(vBone * 260.0) * 0.4;
+							float surfaceHeight = 0.0012 * pits - 0.0025 * smoothstep(0.68, 0.9, boneNoise(vBone * 140.0));
+							normal = boneBump(-vViewPosition, normal, vec2(dFdx(surfaceHeight), dFdy(surfaceHeight)) * 60.0, faceDirection);`,
+						)
+						.replace(
+							"#include <roughnessmap_fragment>",
+							"#include <roughnessmap_fragment>\nroughnessFactor = clamp(roughnessFactor + 0.15 * (pores - 0.5) + 0.1 * smoothstep(0.55, 0.85, stain), 0.3, 1.0);",
+						);
 				};
-				teeth(skull, -0.66, 0.27, 0.38, 1);
+				return material;
+			}
 
-				// The jaw hinges just under the ears: a U-shaped plate under the
-				// lower teeth, with a branch rising to each hinge.
+			// Teeth, crown down, by kind: [half width, half height, half depth, pointed].
+			const TOOTH_KINDS = [
+				[0.0115, 0.026, 0.0065, 0],
+				[0.0095, 0.025, 0.0065, 0],
+				[0.0095, 0.031, 0.0085, 1],
+				[0.0085, 0.023, 0.0105, 0],
+				[0.0085, 0.023, 0.0105, 0],
+				[0.0125, 0.021, 0.0125, 0],
+				[0.012, 0.02, 0.012, 0],
+				[0.011, 0.019, 0.011, 0],
+			];
+
+			function buildTooth([w, h, d, pointed]) {
+				return displace(new THREE.SphereGeometry(1, 12, 10), (x, y, z) => {
+					// Squarer than a sphere, and canines narrow to a point at the crown.
+					const square = 1 + 0.18 * (1 - Math.abs(y)) * (1 - Math.abs(x * z));
+					const taper = pointed ? 1 - 0.65 * Math.max(0, -y) : 1 - 0.15 * Math.max(0, y);
+					return [x * w * square * taper, y * h, z * d * square * taper];
+				});
+			}
+
+			function buildSkull() {
+				rand = mulberry32(2024);
+				const bone = new THREE.Color("#cdc4ae");
+				const grime = new THREE.Color("#4f4636");
+				const shadeBone = (color, x, y, z, ao) => {
+					color
+						.copy(bone)
+						.lerp(grime, (1 - ao) * 0.7 + 0.3 * woodNoise(x * 9 + 900, y * 9 + z * 6))
+						.multiplyScalar(0.12 + 0.88 * ao * ao);
+				};
+				const boneMaterial = agedBone(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.62 }));
+				const skull = new THREE.Group();
+				skull.add(new THREE.Mesh(meshField(craniumField, [-0.42, -0.47, -0.6], [0.42, 0.45, 0.56], 0.013, shadeBone), boneMaterial));
+
 				const jaw = new THREE.Group();
-				jaw.position.set(0, -0.45, 0.02);
-				const jawShape = new THREE.Shape(); // in x/z, chin toward +z
-				jawShape.moveTo(-0.42, 0.02);
-				jawShape.quadraticCurveTo(-0.42, 0.62, 0, 0.64);
-				jawShape.quadraticCurveTo(0.42, 0.62, 0.42, 0.02);
-				jawShape.lineTo(0.3, 0.04);
-				jawShape.quadraticCurveTo(0.3, 0.5, 0, 0.5);
-				jawShape.quadraticCurveTo(-0.3, 0.5, -0.3, 0.04);
-				jawShape.closePath();
-				const plate = new THREE.ExtrudeGeometry(jawShape, { depth: 0.12, bevelEnabled: true, bevelThickness: 0.03, bevelSize: 0.025, bevelSegments: 2, curveSegments: 16 });
-				plate.rotateX(Math.PI / 2).translate(0, -0.3, 0);
-				jaw.add(new THREE.Mesh(plate, toothMaterial));
-				for (const side of [-1, 1]) {
-					const branch = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.36, 0.15), toothMaterial);
-					branch.position.set(side * 0.37, -0.15, 0.06);
-					branch.rotation.x = -0.15;
-					jaw.add(branch);
-				}
-				teeth(jaw, -0.28, 0.24, 0.3, -1);
+				jaw.position.copy(JAW_HINGE);
+				const jawGeometry = meshField(jawField, [-0.31, -0.57, -0.1], [0.31, -0.26, 0.5], 0.01, shadeBone);
+				jawGeometry.translate(-JAW_HINGE.x, -JAW_HINGE.y, -JAW_HINGE.z);
+				jaw.add(new THREE.Mesh(jawGeometry, boneMaterial));
 				skull.add(jaw);
+
+				// Sixteen teeth on each jaw, front to back on both sides. A couple are
+				// missing, a few are stained, none sit perfectly straight.
+				const enamel = new THREE.MeshStandardMaterial({ color: "#d9c89c", roughness: 0.42 });
+				const stained = new THREE.MeshStandardMaterial({ color: "#9a8460", roughness: 0.6 });
+				const toothGeometries = TOOTH_KINDS.map(buildTooth);
+				const missing = new Set([randInt(3, 7), 8 + randInt(4, 7), 16 + randInt(0, 7)]);
+				let n = 0;
+				for (const upper of [true, false]) {
+					for (const side of [-1, 1]) {
+						for (let i = 0; i < 8; i++, n++) {
+							if (missing.has(n)) continue;
+							const a = (i + 0.5) * 0.155;
+							const x = side * 0.15 * Math.sin(a);
+							const z = 0.18 + 0.27 * Math.cos(a);
+							const tooth = new THREE.Mesh(toothGeometries[i], rand() < 0.2 ? stained : enamel);
+							tooth.rotation.set(random(-0.08, 0.08), -side * a, random(-0.08, 0.08) + (upper ? 0 : Math.PI));
+							if (upper) {
+								tooth.position.set(x, -0.425, z);
+								skull.add(tooth);
+							} else {
+								tooth.position.set(x, -0.475, z - 0.012).sub(JAW_HINGE);
+								jaw.add(tooth);
+							}
+						}
+					}
+				}
 				skull.userData.jaw = jaw;
 				return skull;
 			}
 
 			const skull = buildSkull();
-			skull.scale.setScalar(0.45);
-			skull.position.set(1.52, 0.47, 0.45);
-			skull.rotation.set(0.05, -0.55, 0);
+			skull.scale.setScalar(1.0);
+			skull.position.set(1.5, 0.58, 0.42);
+			skull.rotation.set(0.04, -0.55, 0);
 			scene.add(shadowed(skull));
 			let jawChatter = 0;
 			interactives.push({
 				object: skull,
-				body: addDynamic(skull, [hull(skull, 9)], { density: 1.2, asleep: true }),
+				body: addDynamic(skull, [hull(skull, 5)], { density: 1.2 }),
 				onClick: () => (jawChatter = 1.4),
 			});
 
@@ -2126,7 +2431,7 @@
 			}
 
 			const bottle = new THREE.Group();
-			const glassDark = new THREE.MeshPhysicalMaterial({ color: "#0d1a0d", roughness: 0.06, clearcoat: 1, clearcoatRoughness: 0.05 });
+			const glassDark = new THREE.MeshPhysicalMaterial({ color: "#0d1a0d", roughness: 0.14, clearcoat: 1, clearcoatRoughness: 0.18 });
 			bottle.add(
 				new THREE.Mesh(
 					lathe([
@@ -2187,8 +2492,9 @@
 							color: "#ffffff",
 							transparent: true,
 							opacity: 0.2,
-							roughness: 0.05,
+							roughness: 0.14,
 							clearcoat: 1,
+							clearcoatRoughness: 0.18,
 							side: THREE.DoubleSide,
 							depthWrite: false,
 						}),
@@ -2205,7 +2511,7 @@
 						],
 						40,
 					),
-					new THREE.MeshPhysicalMaterial({ color: "#3a0610", roughness: 0.1, clearcoat: 1, transparent: true, opacity: 0.92 }),
+					new THREE.MeshPhysicalMaterial({ color: "#3a0610", roughness: 0.18, clearcoat: 1, clearcoatRoughness: 0.2, transparent: true, opacity: 0.92 }),
 				);
 				wine.userData.noCollide = true;
 				glass.add(wine);
@@ -2350,7 +2656,7 @@
 				face.position.y = 0.26;
 				head.add(face);
 				const eyes = [];
-				const eyeMaterial = new THREE.MeshPhysicalMaterial({ map: eyeTexture(), roughness: 0.1, clearcoat: 1 });
+				const eyeMaterial = new THREE.MeshPhysicalMaterial({ map: eyeTexture(), roughness: 0.15, clearcoat: 1, clearcoatRoughness: 0.14 });
 				for (const side of [-1, 1]) {
 					const eye = new THREE.Mesh(new THREE.SphereGeometry(0.048, 24, 16), eyeMaterial);
 					eye.position.set(side * 0.1, 0.275, 0.225);
@@ -2391,7 +2697,13 @@
 			doll.rotation.set(-0.06, -0.45, 0.08); // slumped, turned toward the pumpkin
 			scene.add(shadowed(doll));
 			addStatic(RAPIER.ColliderDesc.cuboid(0.3, 0.55, 0.35), 1.55, 0.55, -0.6);
-			interactives.push({ object: doll, onClick: () => (doll.userData.blink = 1) });
+			interactives.push({
+				object: doll,
+				onClick: () => {
+					doll.userData.blink = 1;
+					sounds.musicBox();
+				},
+			});
 
 			// =====================================================================
 			// Candy (front)
@@ -2466,8 +2778,9 @@
 						color: "#c8d6c8",
 						transparent: true,
 						opacity: 0.22,
-						roughness: 0.08,
+						roughness: 0.15,
 						clearcoat: 1,
+						clearcoatRoughness: 0.18,
 						side: THREE.DoubleSide,
 						depthWrite: false,
 					}),
@@ -2543,7 +2856,7 @@
 				["#7f8f4e", "#4a5530"],
 				["#8a5a32", "#4a2e18"],
 				["#9aa7ad", "#56636b"],
-			].map((iris) => new THREE.MeshPhysicalMaterial({ map: eyeballTexture(iris), roughness: 0.12, clearcoat: 1, clearcoatRoughness: 0.05 }));
+			].map((iris) => new THREE.MeshPhysicalMaterial({ map: eyeballTexture(iris), roughness: 0.16, clearcoat: 1, clearcoatRoughness: 0.14 }));
 			const nerveMaterial = new THREE.MeshStandardMaterial({ color: "#8c4a46", roughness: 0.5 });
 			const EYE_RADIUS = 0.075;
 			const eyeGeometry = new THREE.SphereGeometry(EYE_RADIUS, 32, 20);
@@ -2596,6 +2909,10 @@
 						points.push(a, mid, mid.clone(), b);
 					}
 				}
+				// The frame thread joining the spoke ends.
+				for (let s = 0; s < spokes - 1; s++) {
+					points.push(corner.clone().addScaledVector(ends[s].dir, ends[s].length), corner.clone().addScaledVector(ends[s + 1].dir, ends[s + 1].length));
+				}
 				for (let i = 0; i < 3; i++) {
 					const start = corner.clone().addScaledVector(ends[randInt(0, spokes - 1)].dir, size * random(0.3, 0.9));
 					points.push(start, start.clone().add(new THREE.Vector3(random(-0.05, 0.05), -random(0.15, 0.45), random(-0.05, 0.05))));
@@ -2604,6 +2921,39 @@
 					new THREE.BufferGeometry().setFromPoints(points),
 					new THREE.LineBasicMaterial({ color: "#d4d6da", transparent: true, opacity: 0.3, depthWrite: false }),
 				);
+			}
+
+			// A sheet of web strung between two edges, each given as [start, end]
+			// (the sides of two candles, or a candle and the tabletop): sagging
+			// threads across, zig-zags between them, a few loose strands hanging.
+			function buildWebBetween([a0, a1], [b0, b1], rows = 9) {
+				const points = [];
+				const threads = [];
+				for (let r = 0; r <= rows; r++) {
+					const from = a0.clone().lerp(a1, clamp(r / rows + random(-0.03, 0.03), 0, 1));
+					const to = b0.clone().lerp(b1, clamp(r / rows + random(-0.03, 0.03), 0, 1));
+					const sagAmount = from.distanceTo(to) * random(0.06, 0.14);
+					const thread = Array.from({ length: 9 }, (_, k) => from.clone().lerp(to, k / 8).add(new THREE.Vector3(0, -sagAmount * 4 * (k / 8) * (1 - k / 8), 0)));
+					threads.push(thread);
+					for (let k = 0; k < 8; k++) if (rand() > 0.06) points.push(thread[k], thread[k + 1]);
+				}
+				for (let r = 0; r < rows; r++) {
+					for (let k = 1; k < 8; k += 2) if (rand() > 0.25) points.push(threads[r][k], threads[r + 1][k + (rand() < 0.5 ? -1 : 1)]);
+				}
+				for (let i = 0; i < 3; i++) {
+					const start = threads[randInt(0, rows)][randInt(2, 6)];
+					points.push(start, start.clone().add(new THREE.Vector3(random(-0.03, 0.03), -random(0.1, 0.35), random(-0.03, 0.03))));
+				}
+				return new THREE.LineSegments(
+					new THREE.BufferGeometry().setFromPoints(points),
+					new THREE.LineBasicMaterial({ color: "#d4d6da", transparent: true, opacity: 0.3, depthWrite: false }),
+				);
+			}
+
+			// A point on a candle's side, facing toward (x, z), at height y.
+			function onCandle([cx, cz, radius], x, z, y) {
+				const facing = new THREE.Vector2(x - cx, z - cz).normalize();
+				return new THREE.Vector3(cx + facing.x * (radius * 1.05 + 0.015), y, cz + facing.y * (radius * 1.05 + 0.015));
 			}
 
 			// A strand sagging between two points.
@@ -2618,12 +2968,22 @@
 
 			rand = mulberry32(404);
 			const tableBack = table.position.z - tableDepth / 2;
+			const tallCandle = [-1.45, -0.88, 0.27]; // [x, z, radius], as placed above
+			const sideCandle = [-1.78, -0.42, 0.24];
 			const tableFront = table.position.z + tableDepth / 2;
 			scene.add(
-				buildCobweb(new THREE.Vector3(-2.0, 0.01, tableBack + 0.02), new THREE.Vector3(0.55, 1, 0.3), new THREE.Vector3(1, 0.05, 0.02), 1.0),
-				buildCobweb(new THREE.Vector3(-1.62, 1.85, -0.72), new THREE.Vector3(-0.2, -0.4, 1), new THREE.Vector3(-0.9, -0.6, 0.6), 0.7),
+				// Between the tallest candle and its short neighbour.
+				buildWebBetween(
+					[onCandle(tallCandle, -1.78, -0.42, 0.55), onCandle(tallCandle, -1.78, -0.42, 1.05)],
+					[onCandle(sideCandle, -1.45, -0.88, 0.5), onCandle(sideCandle, -1.45, -0.88, 1.08)],
+				),
+				// From the tallest candle's side down to the tabletop in the back corner.
+				buildWebBetween(
+					[onCandle(tallCandle, -2.0, tableBack, 0.12), onCandle(tallCandle, -2.0, tableBack, 0.85)],
+					[new THREE.Vector3(-1.95, 0.012, tableBack + 0.45), new THREE.Vector3(-1.7, 0.012, tableBack + 0.04)],
+					8,
+				),
 				buildCobweb(new THREE.Vector3(legX - 0.02, -0.45, table.position.z + legZ - 0.02), new THREE.Vector3(-1, 0, 0), new THREE.Vector3(0, -1, 0), 0.9),
-				buildCobweb(new THREE.Vector3(2.0, 0.01, tableBack + 0.03), new THREE.Vector3(-0.6, 1, 0.4), new THREE.Vector3(-1, 0.1, 0.05), 0.8),
 				strand(new THREE.Vector3(0.82, 1.7, -1.02), new THREE.Vector3(1.5, 1.05, -0.78), 0.12),
 				strand(new THREE.Vector3(0.84, 1.55, -1.0), new THREE.Vector3(1.62, 0.9, -0.66), 0.08),
 				strand(new THREE.Vector3(-0.88, 1.5, -1.05), new THREE.Vector3(-1.45, 1.95, -0.88), 0.1),
@@ -2667,7 +3027,7 @@
 						varying float vAlpha;
 						void main() {
 							float d = length(gl_PointCoord - 0.5);
-							gl_FragColor = vec4(0.78, 0.75, 0.71, smoothstep(0.5, 0.1, d) * vAlpha);
+							gl_FragColor = vec4(0.58, 0.53, 0.47, smoothstep(0.5, 0.1, d) * vAlpha);
 						}
 					`,
 				}),
@@ -2714,10 +3074,11 @@
 
 			// =====================================================================
 			// Picking up and clicking
-			// A press on something interactive takes the pointer away from the
-			// camera controls. Small movement + release = click; otherwise it's a
-			// drag: the body is pulled toward the pointer on a plane facing the
-			// camera, still colliding with everything, and falls when let go.
+			// Releasing with barely any movement is a click. Pressing on something
+			// you can pick up takes the pointer away from the camera controls, and
+			// moving drags it: the body is pulled toward the pointer on a plane
+			// facing the camera, still colliding with everything, and falls when let
+			// go. On something you can only click, a drag still turns the camera.
 			// =====================================================================
 
 			const raycaster = new THREE.Raycaster();
@@ -2727,11 +3088,16 @@
 			const pickables = [...interactives.map((entry) => entry.object), lidRoot, ...occluders];
 			interactives.push({ object: lidRoot, body: lidBody });
 
+			function shown(object) {
+				for (; object; object = object.parent) if (!object.visible) return false;
+				return true;
+			}
+
 			function pick(event) {
 				pointerNDC.set((event.clientX / innerWidth) * 2 - 1, -(event.clientY / innerHeight) * 2 + 1);
 				raycaster.setFromCamera(pointerNDC, camera);
 				for (const hit of raycaster.intersectObjects(pickables, true)) {
-					if (hit.object.material === wireMaterial || !hit.object.visible) continue;
+					if (hit.object.material === wireMaterial || !shown(hit.object)) continue;
 					for (let object = hit.object; object; object = object.parent) {
 						const entry = interactives.find((e) => e.object === object);
 						if (entry) return { entry, point: hit.point };
@@ -2752,8 +3118,9 @@
 					if (!event.isPrimary || event.button !== 0 || event.target !== renderer.domElement) return;
 					const hit = pick(event);
 					if (!hit) return;
-					controls.enabled = false; // the controls' own listener runs after this one
 					press = { ...hit, x: event.clientX, y: event.clientY, dragging: false };
+					if (!hit.entry.body) return; // click-only: leave the camera free to drag
+					controls.enabled = false; // the controls' own listener runs after this one
 					dragTarget.copy(hit.point);
 				},
 				{ capture: true },
@@ -2817,11 +3184,17 @@
 					world.step();
 					physicsTime -= PHYSICS_STEP;
 				}
-				for (const { body, object } of dynamicBodies) {
+				for (const entry of dynamicBodies) {
+					const { body, object } = entry;
 					const t = body.translation();
 					const r = body.rotation();
 					object.position.set(t.x, t.y, t.z);
 					object.quaternion.set(r.x, r.y, r.z, r.w);
+					// A sudden stop means it hit something: make it heard.
+					const v = body.linvel();
+					const speed = Math.hypot(v.x, v.y, v.z);
+					if ((entry.speed ?? 0) - speed > 1.5 && press?.entry.body !== body) sounds.impact(object, entry.speed, impactKinds.get(object) ?? "tick");
+					entry.speed = speed;
 				}
 			}
 
@@ -2887,7 +3260,7 @@
 
 			rand = mulberry32(1337);
 			const envTime = { value: 0 };
-			scene.fog = new THREE.FogExp2("#1c2230", 0.026);
+			scene.fog = new THREE.FogExp2("#1d1a2c", 0.026);
 
 			// Fog sheets: wide horizontal layers of drifting noise, thick near the
 			// ground and kept clear right around the table.
@@ -2948,7 +3321,7 @@
 								float b = texture2D(uMap, p * 0.08 - vec2(uTime * 0.006, uSeed - uTime * 0.003)).r;
 								float d = length(p);
 								float fade = smoothstep(uClear, uClear + 5.0, d) * (1.0 - smoothstep(70.0, 115.0, d));
-								gl_FragColor = vec4(0.36, 0.4, 0.48, a * (0.55 + 0.6 * b) * uOpacity * fade);
+								gl_FragColor = vec4(0.12, 0.11, 0.2, a * (0.55 + 0.6 * b) * uOpacity * fade);
 							}
 						`,
 					}),
@@ -2973,7 +3346,8 @@
 
 			const barkMaterial = new THREE.MeshStandardMaterial({ color: "#1e1915", roughness: 1 });
 
-			function buildTree(height, crooked, perch) {
+			// `hangs` collects points under the smaller branches where a bat could roost.
+			function buildTree(height, crooked, perch, hangs) {
 				const parts = [];
 				const grow = (start, direction, length, radius, depth) => {
 					const points = [start.clone()];
@@ -2988,6 +3362,7 @@
 						points.push(p);
 					}
 					parts.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 18, radius, 7, false));
+					if (depth >= 2 && Math.abs(d.y) < 0.75) hangs.push(points[3].clone().setY(points[3].y - radius), points[5].clone().setY(points[5].y - radius));
 					if (depth >= 4 || radius < 0.05) return;
 					for (let c = 0, count = depth === 0 ? randInt(3, 4) : randInt(2, 3); c < count; c++) {
 						const at = points[randInt(2, 6)];
@@ -3023,10 +3398,14 @@
 				[30, -16, 30, 0.34],
 			];
 			const bigTree = new THREE.Vector3(trees[0][0], groundY, trees[0][1]);
+			const roostPoints = [];
 			for (const [x, z, height, crooked, branch] of trees) {
-				const tree = new THREE.Mesh(buildTree(height, crooked, branch), barkMaterial);
+				const hangs = [];
+				const tree = new THREE.Mesh(buildTree(height, crooked, branch, hangs), barkMaterial);
 				tree.position.set(x, groundY, z);
 				scene.add(tree);
+				// Only branches low enough to see under the fog and treetops.
+				for (const point of hangs) if (point.y > 5 && point.y < 17 && z > -45) roostPoints.push(point.add(tree.position));
 			}
 
 			// --- Gravestones ------------------------------------------------------
@@ -3197,8 +3576,10 @@
 						varying vec2 vUv;
 						varying float vFacing;
 						void main() {
-							vec3 color = texture2D(uMap, vUv).rgb * vec3(1.0, 0.86, 0.68);
-							gl_FragColor = vec4(color * (0.55 + 0.45 * pow(vFacing, 0.6)), 1.0);
+							// The texture is already decoded to linear; the tint is a warm, sickly yellow.
+							vec3 color = texture2D(uMap, vUv).rgb * vec3(1.0, 0.71, 0.42);
+							// max(): pow() of a hair below zero is NaN, and bloom smears a NaN pixel into a black block.
+							gl_FragColor = vec4(color * pow(0.55 + 0.45 * pow(max(vFacing, 1e-4), 0.6), 2.2) * 1.3, 1.0);
 						}
 					`,
 				}),
@@ -3282,7 +3663,7 @@
 						float n = sin(p.x * 9.0 + uTime * 1.3) * sin(p.y * 8.0 - uTime * 1.1) * 0.5 + 0.5;
 						float glow = 0.35 + 0.35 * swirl * n + 0.3 * uSurge;
 						vec3 color = mix(vec3(0.04, 0.3, 0.05), vec3(0.5, 1.0, 0.35), glow);
-						gl_FragColor = vec4(color * smoothstep(1.0, 0.8, r), 1.0);
+						gl_FragColor = vec4(pow(color, vec3(2.2)) * 1.6 * smoothstep(1.0, 0.8, r), 1.0);
 						#include <fog_fragment>
 					}
 				`,
@@ -3309,7 +3690,7 @@
 			cauldron.position.set(8, groundY, -10); // out to the right, clear of the table from most angles
 			scene.add(cauldron);
 			let cauldronSurge = 0;
-			interactives.push({ object: cauldron, onClick: () => (cauldronSurge = 2.5) });
+			interactives.push({ object: cauldron, onClick: () => boilOver() });
 			pickables.push(cauldron);
 
 			// --- A broom, bristles up, leaning against the table -----------------
@@ -3391,6 +3772,102 @@
 
 			const flockBats = Array.from({ length: 14 }, buildBat);
 			const treeBats = Array.from({ length: 2 }, buildBat);
+
+			// Bats roosting upside down under branches. Now and then one drops off
+			// and flies away, and later another arrives to hang somewhere else.
+			const roosts = Array.from({ length: 7 }, () => ({
+				bat: buildBat(),
+				state: "away",
+				timer: random(0, 12),
+				point: null,
+				from: new THREE.Vector3(),
+				phase: random(0, TAU),
+			}));
+			const takenRoosts = new Set();
+			function freeRoostPoint() {
+				for (let tries = 0; tries < 20; tries++) {
+					const point = roostPoints[randInt(0, roostPoints.length - 1)];
+					if (point && !takenRoosts.has(point)) return point;
+				}
+				return null;
+			}
+			// Start with most of them already hanging.
+			for (const roost of roosts.slice(0, 5)) {
+				roost.point = freeRoostPoint();
+				if (!roost.point) continue;
+				takenRoosts.add(roost.point);
+				roost.state = "hanging";
+				roost.timer = random(15, 60);
+				roost.bat.visible = true;
+			}
+
+			function hang(bat, point, t, phase) {
+				bat.position.copy(point).y -= 0.22; // feet on the branch
+				bat.rotation.set(Math.PI / 2, 0, 0.1 * Math.sin(t * 0.6 + phase)); // head down, swaying a little
+				// Wings swung back along the body, wrapped around it.
+				bat.userData.wings[0].rotation.set(0, 1.4, 0);
+				bat.userData.wings[1].rotation.set(0, -1.4, 0);
+			}
+
+			// Spread the wings again for flight.
+			const unfold = (bat) => bat.userData.wings.forEach((wing) => (wing.rotation.y = 0));
+
+			function startle(roost) {
+				if (roost.state !== "hanging") return;
+				roost.state = "leaving";
+				roost.timer = 0;
+				unfold(roost.bat);
+				roost.from.copy(roost.bat.position);
+				roost.away = new THREE.Vector3(random(-1, 1), random(0.4, 0.9), random(-1, 0.3)).normalize();
+				takenRoosts.delete(roost.point);
+			}
+
+			function updateRoosts(dt, t) {
+				for (const roost of roosts) {
+					const { bat } = roost;
+					roost.timer += roost.state === "hanging" || roost.state === "away" ? -dt : dt;
+					if (roost.state === "hanging") {
+						hang(bat, roost.point, t, roost.phase);
+						if (Math.random() < dt * 0.05) bat.userData.wings[1].rotation.y = -1.1; // a twitch
+						if (roost.timer <= 0) startle(roost);
+					} else if (roost.state === "leaving") {
+						// Drop, then flap away up and out.
+						const k = roost.timer;
+						bat.position.copy(roost.from).addScaledVector(roost.away, k * k * 4 + k * 3);
+						bat.position.y -= Math.max(0, 0.6 - k) * k * 2;
+						bat.lookAt(bat.position.clone().add(roost.away));
+						flap(bat, t);
+						if (k > 4) {
+							bat.visible = false;
+							roost.state = "away";
+							roost.timer = random(10, 30);
+						}
+					} else if (roost.state === "away") {
+						if (roost.timer > 0) continue;
+						roost.point = freeRoostPoint();
+						if (!roost.point) {
+							roost.timer = 5;
+							continue;
+						}
+						takenRoosts.add(roost.point);
+						roost.state = "arriving";
+						roost.timer = 0;
+						roost.from.copy(roost.point).add(new THREE.Vector3(random(-20, 20), random(6, 12), random(-15, 5)));
+						unfold(bat);
+						bat.visible = true;
+					} else if (roost.state === "arriving") {
+						const k = smoothstep(0, 4, roost.timer);
+						const previous = bat.position.clone();
+						bat.position.lerpVectors(roost.from, roost.point, k).add(new THREE.Vector3(0, Math.sin(k * Math.PI) * 2 - 0.35 * k, Math.sin(t * 5) * 0.3 * (1 - k)));
+						if (bat.position.distanceToSquared(previous) > 1e-6) bat.lookAt(bat.position.clone().add(bat.position.clone().sub(previous)));
+						flap(bat, t);
+						if (roost.timer > 4) {
+							roost.state = "hanging";
+							roost.timer = random(20, 70);
+						}
+					}
+				}
+			}
 			treeBats.forEach((bat) => (bat.visible = true));
 			let flock = null;
 			let nextFlock = random(6, 12);
@@ -3823,6 +4300,7 @@
 						nextFlock = random(15, 32);
 					}
 				}
+				updateRoosts(dt, t);
 				treeBats.forEach((bat, i) => {
 					const a = t * (0.5 + i * 0.17) + i * 2;
 					const radius = 7 + 2 * Math.sin(t * 0.7 + i);
@@ -3836,6 +4314,7 @@
 				if (!witchFlight && nextWitch <= 0) {
 					witchFlight = { time: 0, duration: random(11, 15), rise: random(0.02, 0.07), height: random(0.04, 0.1) };
 					witch.visible = true;
+					sounds.witchPasses();
 				}
 				if (witchFlight) {
 					witchFlight.time += dt;
@@ -3884,7 +4363,7 @@
 			// Night lighting
 			// =====================================================================
 
-			scene.add(new THREE.HemisphereLight("#4f5672", "#1a120c", 1.5));
+			scene.add(new THREE.HemisphereLight("#565079", "#1a120c", 1.5));
 
 			const moon = new THREE.DirectionalLight("#c3ccef", 1.5);
 			moon.position.set(-3.6, 7.5, -10); // same side as the moon in the sky, but higher
@@ -3936,6 +4415,1373 @@
 			}
 
 			// =====================================================================
+			// Post-processing
+			// The scene renders into a high-range buffer so flames, the moon and
+			// the potion can be brighter than white and bloom. Then tone mapping,
+			// and a final grade: cool shadows, warm highlights, a gentle contrast
+			// curve, a vignette and a little film grain.
+			// =====================================================================
+
+			const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 }));
+			composer.addPass(new RenderPass(scene, camera));
+
+			const fullscreenVertex = `
+				varying vec2 vUv;
+				void main() {
+					vUv = uv;
+					gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+				}
+			`;
+
+			// Cap how bright any one pixel can be before bloom. A pinpoint glint on
+			// glossy glass can be hundreds of times brighter than white, and bloom's
+			// low-resolution layers smear a spike like that into a soft square.
+			composer.addPass(
+				new ShaderPass({
+					uniforms: { tDiffuse: { value: null } },
+					vertexShader: fullscreenVertex,
+					fragmentShader: `
+						uniform sampler2D tDiffuse;
+						varying vec2 vUv;
+						void main() {
+							vec4 c = texture2D(tDiffuse, vUv);
+							float peak = max(max(c.r, c.g), c.b);
+							c.rgb *= min(1.0, 4.0 / max(peak, 1e-4));
+							gl_FragColor = c;
+						}
+					`,
+				}),
+			);
+			const bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.5, 0.3, 0.85);
+			composer.addPass(bloom);
+			composer.addPass(new OutputPass());
+
+			// The old-film look: cool shadows and warm highlights on faded stock,
+			// projector flicker, heavy grain, dust, the odd scratch, and a frame
+			// that never sits quite still.
+			const grade = new ShaderPass({
+				uniforms: {
+					tDiffuse: { value: null },
+					uResolution: { value: new THREE.Vector2(1, 1) },
+					uSeed: { value: 0 },
+					uFlicker: { value: 1 },
+					uScratch: { value: new THREE.Vector2(0.5, 0) }, // x position, strength (0 = none)
+					uWeave: { value: new THREE.Vector2() },
+				},
+				vertexShader: fullscreenVertex,
+				fragmentShader: `
+					uniform sampler2D tDiffuse;
+					uniform vec2 uResolution;
+					uniform float uSeed;
+					uniform float uFlicker;
+					uniform vec2 uScratch;
+					uniform vec2 uWeave;
+					varying vec2 vUv;
+
+					float hash(vec2 p) {
+						return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+					}
+
+					void main() {
+						vec3 c = texture2D(tDiffuse, vUv + uWeave).rgb;
+						float l = dot(c, vec3(0.299, 0.587, 0.114));
+						// Cool shadows, warm highlights.
+						c = mix(c, c * vec3(0.92, 1.0, 1.1), (1.0 - smoothstep(0.0, 0.45, l)) * 0.35);
+						c = mix(c, c * vec3(1.06, 1.0, 0.92), smoothstep(0.5, 1.0, l) * 0.3);
+						// A gentle S-curve.
+						c = mix(c, c * c * (3.0 - 2.0 * c), 0.25);
+						// Faded stock: a little less color, slightly lifted blacks.
+						c = mix(vec3(l), c, 0.8);
+						c = c * 0.95 + vec3(0.022, 0.02, 0.016);
+						// Projector flicker.
+						c *= uFlicker;
+						// Vignette.
+						vec2 q = vUv - 0.5;
+						q.x *= uResolution.x / uResolution.y;
+						c *= mix(0.45, 1.0, 1.0 - smoothstep(0.2, 0.95, length(q)));
+						// Heavy grain in clumps a couple of pixels wide, strongest in the mid-tones.
+						vec2 pixel = floor(gl_FragCoord.xy);
+						float grain = (hash(floor(pixel / 2.0) + uSeed) - 0.5) + 0.5 * (hash(pixel + uSeed * 1.37) - 0.5);
+						float mid = 1.0 - min(1.0, abs(l - 0.4) * 1.5);
+						c += grain * 0.12 * (0.45 + 0.55 * mid);
+						// Dust: a few specks, different every frame, dark and light.
+						vec2 dustUv = vUv * vec2(uResolution.x / uResolution.y, 1.0) * 70.0;
+						vec2 dustCell = floor(dustUv);
+						if (hash(dustCell + uSeed * 3.1) > 0.9975) {
+							vec2 local = fract(dustUv) - 0.5 - (vec2(hash(dustCell + 1.3), hash(dustCell + 7.1)) - 0.5) * 0.5;
+							float speck = 1.0 - smoothstep(0.02, 0.12, length(local * vec2(1.0, 0.6 + hash(dustCell))));
+							c = mix(c, vec3(hash(dustCell + uSeed) > 0.4 ? 0.02 : 0.85), speck * 0.75);
+						}
+						// A scratch running down the frame, broken in places.
+						if (uScratch.y > 0.0) {
+							float x = uScratch.x + 0.002 * sin(vUv.y * 23.0 + uSeed) + 0.001 * sin(vUv.y * 71.0);
+							float line = 1.0 - smoothstep(0.0, 1.5 / uResolution.x, abs(vUv.x - x));
+							float unbroken = step(0.25, hash(vec2(floor(vUv.y * 90.0), uSeed)));
+							c = mix(c, vec3(0.82, 0.8, 0.74), line * unbroken * uScratch.y * 0.55);
+						}
+						gl_FragColor = vec4(c, 1.0);
+					}
+				`,
+			});
+			composer.addPass(grade);
+
+			// Old film runs at 24 frames a second, so the grain, dust and jitter
+			// step at that rate even when the scene renders faster.
+			const film = { frame: 0, flicker: 1, flickerTarget: 1, scratch: 0, scratchX: 0.5 };
+			function updateFilm(dt) {
+				film.frame += dt * 24;
+				if (film.frame >= 1) {
+					film.frame %= 1;
+					grade.uniforms.uSeed.value = Math.random() * 100;
+					film.flickerTarget = 0.96 + Math.random() * 0.06 - (Math.random() < 0.02 ? 0.08 : 0);
+					grade.uniforms.uWeave.value.set((Math.random() - 0.5) * 0.0006, (Math.random() - 0.5) * 0.0009);
+				}
+				film.flicker += (film.flickerTarget - film.flicker) * Math.min(1, dt * 20);
+				grade.uniforms.uFlicker.value = film.flicker;
+				if (film.scratch <= 0 && Math.random() < dt * 0.25) {
+					film.scratch = 0.2 + Math.random() * 0.8;
+					film.scratchX = 0.1 + Math.random() * 0.8;
+				}
+				film.scratch -= dt;
+				film.scratchX += (Math.random() - 0.5) * 0.002;
+				grade.uniforms.uScratch.value.set(film.scratchX, film.scratch > 0 ? 0.6 + Math.random() * 0.4 : 0);
+			}
+
+			// If the frame rate can't keep up, step down: first full-resolution
+			// rendering on high-density screens, then bloom and the candle
+			// cluster's shadows. It only ever steps down, so it can't flicker.
+			const quality = { level: 2, frameTime: 1 / 60, checkAt: 5 };
+			function adaptQuality(rawDt, t) {
+				if (rawDt < 0.2) quality.frameTime += (rawDt - quality.frameTime) * 0.05; // ignore stalls, like a hidden tab
+				if (t < quality.checkAt || quality.level === 0) return;
+				quality.checkAt = t + 3;
+				if (quality.frameTime < 1 / 40) return;
+				quality.level--;
+				if (quality.level === 1) renderer.setPixelRatio(1);
+				if (quality.level === 0) {
+					bloom.enabled = false;
+					clusterLight.castShadow = false;
+				}
+				resize();
+			}
+
+			// =====================================================================
+			// Contact shadows
+			// Soft dark patches where things meet the tabletop: the shadow maps are
+			// too coarse to darken that last bit of contact. Things you can pick up
+			// take their patch with them, and it fades as they're lifted.
+			// =====================================================================
+
+			const [contactCanvas, contactCtx] = makeCanvas(128, 128);
+			const contactGradient = contactCtx.createRadialGradient(64, 64, 0, 64, 64, 64);
+			contactGradient.addColorStop(0, "rgba(0, 0, 0, 0.8)");
+			contactGradient.addColorStop(0.45, "rgba(0, 0, 0, 0.38)");
+			contactGradient.addColorStop(1, "rgba(0, 0, 0, 0)");
+			contactCtx.fillStyle = contactGradient;
+			contactCtx.fillRect(0, 0, 128, 128);
+			const contactTexture = new THREE.CanvasTexture(contactCanvas);
+			const contactGeometry = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
+			const contactShadows = []; // { patch, object, strength, restY }
+
+			function contactPatch(x, z, radius, strength) {
+				const patch = new THREE.Mesh(
+					contactGeometry,
+					new THREE.MeshBasicMaterial({
+						color: "#000",
+						map: contactTexture,
+						transparent: true,
+						depthWrite: false,
+						opacity: strength,
+						polygonOffset: true,
+						polygonOffsetFactor: -2,
+					}),
+				);
+				patch.scale.setScalar(radius * 2);
+				patch.position.set(x, 0.012, z);
+				scene.add(patch);
+				return patch;
+			}
+
+			function followingShadow(object, radius, strength, restY = object.position.y) {
+				contactShadows.push({ patch: contactPatch(object.position.x, object.position.z, radius, strength), object, strength, restY });
+			}
+
+			contactPatch(0, 0, W * 0.92, 0.55);
+			for (const candle of candleCluster.children) {
+				if (!candle.material?.userData?.level) continue;
+				candle.geometry.computeBoundingBox();
+				contactPatch(candle.position.x, candle.position.z, candle.geometry.boundingBox.max.x * 1.1, 0.5);
+			}
+			contactPatch(jar.position.x, jar.position.z, 0.36, 0.45);
+			contactPatch(bottle.position.x, bottle.position.z, 0.34, 0.5);
+			contactPatch(doll.position.x, doll.position.z + 0.1, 0.42, 0.5);
+			followingShadow(skull, 0.5, 0.55);
+			followingShadow(apple, 0.24, 0.5);
+			followingShadow(wineGlass, 0.18, 0.4);
+			followingShadow(lidRoot, 0.6, 0.5, 0.06);
+			followingShadow(jarLid, 0.28, 0.4, 0.04);
+			for (const entry of interactives) {
+				if (entry.body && !contactShadows.some((shadow) => shadow.object === entry.object) && entry.object !== jarLid) {
+					const small = entry.object.children.length <= 2;
+					followingShadow(entry.object, small ? 0.1 : 0.12, 0.4, small ? 0.08 : entry.object.position.y);
+				}
+			}
+
+			function updateContactShadows() {
+				for (const { patch, object, strength, restY } of contactShadows) {
+					const { x, y, z } = object.position;
+					const onTable = Math.abs(x) < 2 && z > tableBack && z < tableFront && y > -0.2;
+					patch.visible = onTable;
+					if (!onTable) continue;
+					patch.position.set(x, 0.012, z);
+					patch.material.opacity = strength * (1 - smoothstep(0, 0.8, y - restY));
+				}
+			}
+
+			// =====================================================================
+			// Sound
+			// All synthesized with the Web Audio API, no files. Underneath, a low
+			// beating drone; around it, wind that swells with the gusts that bend
+			// the flames and sometimes moans, crickets that stop all at once, an
+			// owl, a far-off bell, creaking wood, whispers just out of view. Up
+			// close: candle crackle, the cauldron, bats, the doll's music box, and
+			// knocks when things land. Inside the pumpkin everything goes muffled
+			// and you can hear a heartbeat.
+			// Browsers only allow sound after an interaction, so it starts on the
+			// first click, tap or key press. The button in the corner mutes.
+			// =====================================================================
+
+			const sounds = (() => {
+				let ctx = null;
+				let master;
+				let reverb;
+				let noise;
+				let wind;
+				let simmer;
+				let muted = false;
+				const crickets = [];
+				let hushUntil = 0;
+				let nextCrackle = 0;
+				let nextBlup = 0;
+				let nextOwl = 0;
+				let nextSqueak = 0;
+				let nextMusicBox = 0;
+				let lastChatter = 0;
+				let musicUntil = 0;
+				let muffle;
+				let drone;
+				let nextMoan = 0;
+				let nextWhisper = 0;
+				let nextBell = 0;
+				let nextCreak = 0;
+				let nextBeat = 0;
+				let nextSilence = 0;
+				const changed = []; // called when sound turns on or off
+				const notify = () => changed.forEach((fn) => fn());
+				const facing = new THREE.Vector3();
+				const cauldronTop = cauldron.position.clone().setY(groundY + 2);
+
+				// White, or brown (deep and rumbly, for wind and simmering).
+				function noiseBuffer(seconds, brown) {
+					const buffer = ctx.createBuffer(1, Math.floor(ctx.sampleRate * seconds), ctx.sampleRate);
+					const data = buffer.getChannelData(0);
+					let last = 0;
+					for (let i = 0; i < data.length; i++) {
+						const white = Math.random() * 2 - 1;
+						last = (last + 0.02 * white) / 1.02;
+						data[i] = brown ? last * 3.5 : white;
+					}
+					return buffer;
+				}
+
+				// Send a sound to the speakers (and some to the reverb), optionally
+				// from a place in the scene so it pans and fades with distance.
+				function route(node, { position = null, wet = 0.25, gain = 1, ref = 3 } = {}) {
+					let tail = node.connect(ctx.createGain());
+					tail.gain.value = gain;
+					if (position) {
+						const panner = new PannerNode(ctx, {
+							panningModel: "HRTF",
+							distanceModel: "inverse",
+							refDistance: ref,
+							rolloffFactor: 1.2,
+							positionX: position.x,
+							positionY: position.y,
+							positionZ: position.z,
+						});
+						tail = tail.connect(panner);
+					}
+					tail.connect(master);
+					if (wet) {
+						const send = ctx.createGain();
+						send.gain.value = wet;
+						tail.connect(send);
+						send.connect(reverb);
+					}
+					return tail;
+				}
+
+				function envelope(param, t, peak, attack, decay) {
+					param.setValueAtTime(0.0001, t);
+					param.exponentialRampToValueAtTime(peak, t + attack);
+					param.exponentialRampToValueAtTime(0.0001, t + attack + decay);
+				}
+
+				// A short filtered noise burst: clicks, puffs, knocks.
+				function burst({ position, filter, frequency, q = 1, peak, attack = 0.004, decay, wet = 0.2, ref = 3, delay = 0 }) {
+					const t = ctx.currentTime + delay;
+					const source = ctx.createBufferSource();
+					source.buffer = noise;
+					const shaped = ctx.createBiquadFilter();
+					shaped.type = filter;
+					shaped.frequency.value = frequency;
+					shaped.Q.value = q;
+					const level = ctx.createGain();
+					envelope(level.gain, t, peak, attack, decay);
+					source.connect(shaped).connect(level);
+					route(level, { position, wet, ref });
+					source.start(t, Math.random() * 1.5);
+					source.stop(t + attack + decay + 0.05);
+				}
+
+				// A short tone, optionally gliding in pitch: blups, hoots, chimes.
+				function tone({ position, type = "sine", from, to = from, glide = 0.1, peak, attack = 0.005, decay, wet = 0.3, ref = 3, delay = 0 }) {
+					const t = ctx.currentTime + delay;
+					const oscillator = ctx.createOscillator();
+					oscillator.type = type;
+					oscillator.frequency.setValueAtTime(from, t);
+					if (to !== from) oscillator.frequency.exponentialRampToValueAtTime(to, t + glide);
+					const level = ctx.createGain();
+					envelope(level.gain, t, peak, attack, decay);
+					oscillator.connect(level);
+					route(level, { position, wet, ref });
+					oscillator.start(t);
+					oscillator.stop(t + attack + decay + 0.05);
+				}
+
+				function start() {
+					if (ctx) {
+						if (ctx.state === "suspended") ctx.resume();
+						return;
+					}
+					ctx = new AudioContext();
+					ctx.onstatechange = notify;
+					const compressor = ctx.createDynamicsCompressor();
+					compressor.connect(ctx.destination);
+					// Everything passes through this; it closes down inside the pumpkin.
+					muffle = ctx.createBiquadFilter();
+					muffle.type = "lowpass";
+					muffle.frequency.value = 18000;
+					muffle.connect(compressor);
+					master = ctx.createGain();
+					master.gain.value = 0;
+					master.gain.linearRampToValueAtTime(muted ? 0 : 0.9, ctx.currentTime + 4); // fade in
+					master.connect(muffle);
+
+					// A long, dark outdoor reverb from a decaying noise impulse.
+					const length = Math.floor(ctx.sampleRate * 4.5);
+					const impulse = ctx.createBuffer(2, length, ctx.sampleRate);
+					for (let c = 0; c < 2; c++) {
+						const data = impulse.getChannelData(c);
+						for (let i = 0; i < length; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 3);
+					}
+					reverb = ctx.createConvolver();
+					reverb.buffer = impulse;
+					const reverbReturn = ctx.createGain();
+					reverbReturn.gain.value = 0.55;
+					const darken = ctx.createBiquadFilter();
+					darken.type = "lowpass";
+					darken.frequency.value = 2200;
+					reverb.connect(darken).connect(reverbReturn);
+					reverbReturn.connect(master);
+					noise = noiseBuffer(2, false);
+
+					// Wind: brown noise through a band-pass that opens up in the gusts.
+					const windSource = ctx.createBufferSource();
+					windSource.buffer = noiseBuffer(8, true);
+					windSource.loop = true;
+					const band = ctx.createBiquadFilter();
+					band.type = "bandpass";
+					band.frequency.value = 350;
+					band.Q.value = 0.7;
+					const windLevel = ctx.createGain();
+					windLevel.gain.value = 0.15;
+					windSource.connect(band).connect(windLevel);
+					route(windLevel, { wet: 0.15 });
+					windSource.start();
+					wind = { band, level: windLevel };
+
+					// Crickets: three, off in the grass at different pitches.
+					for (const [pan, pitch] of [
+						[-0.75, 4300],
+						[0.35, 4650],
+						[0.85, 4050],
+					]) {
+						const oscillator = ctx.createOscillator();
+						oscillator.frequency.value = pitch;
+						const level = ctx.createGain();
+						level.gain.value = 0;
+						const panner = ctx.createStereoPanner();
+						panner.pan.value = pan;
+						oscillator.connect(level).connect(panner);
+						route(panner, { wet: 0.5, gain: 0.04 });
+						oscillator.start();
+						crickets.push({ level, next: ctx.currentTime + Math.random() * 2, period: 0.55 + Math.random() * 0.35 });
+					}
+
+					// The cauldron simmers.
+					const simmerSource = ctx.createBufferSource();
+					simmerSource.buffer = noiseBuffer(4, true);
+					simmerSource.loop = true;
+					const low = ctx.createBiquadFilter();
+					low.type = "lowpass";
+					low.frequency.value = 260;
+					simmer = ctx.createGain();
+					simmer.gain.value = 0.4;
+					simmerSource.connect(low).connect(simmer);
+					route(simmer, { position: cauldronTop, wet: 0.3, ref: 4 });
+					simmerSource.start();
+
+					// Dread: two low tones a semitone apart, beating slowly against each
+					// other, with a faint tritone above, breathing through a filter.
+					const droneFilter = ctx.createBiquadFilter();
+					droneFilter.type = "lowpass";
+					droneFilter.frequency.value = 220;
+					droneFilter.Q.value = 2;
+					const droneLevel = ctx.createGain();
+					droneLevel.gain.value = 0;
+					for (const [frequency, type, level] of [
+						[55, "sine", 1],
+						[58.3, "sine", 0.8],
+						[77.8, "triangle", 0.25],
+						[155.6, "sine", 0.12],
+					]) {
+						const oscillator = ctx.createOscillator();
+						oscillator.type = type;
+						oscillator.frequency.value = frequency;
+						const gain = ctx.createGain();
+						gain.gain.value = level;
+						oscillator.connect(gain).connect(droneFilter);
+						oscillator.start();
+					}
+					droneFilter.connect(droneLevel);
+					route(droneLevel, { wet: 0.5 });
+					drone = { filter: droneFilter, level: droneLevel };
+
+					const now = ctx.currentTime;
+					nextOwl = now + 12 + Math.random() * 20;
+					nextMusicBox = now + 60 + Math.random() * 60;
+					nextMoan = now + 8 + Math.random() * 10;
+					nextWhisper = now + 25 + Math.random() * 30;
+					nextBell = now + 40 + Math.random() * 40;
+					nextCreak = now + 10 + Math.random() * 20;
+					nextSilence = now + 30 + Math.random() * 40;
+					notify();
+				}
+
+				// Wind that rises into a moan: noise through a narrow, gliding filter.
+				function moan() {
+					const t = ctx.currentTime;
+					const length = 4 + Math.random() * 4;
+					const pitch = 240 + Math.random() * 140;
+					const source = ctx.createBufferSource();
+					source.buffer = noise;
+					source.loop = true;
+					const band = ctx.createBiquadFilter();
+					band.type = "bandpass";
+					band.Q.value = 10 + Math.random() * 6;
+					band.frequency.setValueAtTime(pitch, t);
+					band.frequency.exponentialRampToValueAtTime(pitch * (1.5 + Math.random() * 0.6), t + length * 0.45);
+					band.frequency.exponentialRampToValueAtTime(pitch * 0.8, t + length);
+					const level = ctx.createGain();
+					level.gain.setValueAtTime(0.0001, t);
+					level.gain.exponentialRampToValueAtTime(0.5, t + length * 0.4);
+					level.gain.exponentialRampToValueAtTime(0.0001, t + length);
+					const pan = ctx.createStereoPanner();
+					const side = Math.random() * 1.6 - 0.8;
+					pan.pan.setValueAtTime(side, t);
+					pan.pan.linearRampToValueAtTime(-side * 0.5, t + length);
+					source.connect(band).connect(level).connect(pan);
+					route(pan, { wet: 0.6 });
+					source.start(t, Math.random() * 1.5);
+					source.stop(t + length + 0.1);
+				}
+
+				// Whispering: breathy noise shaped into syllables by two moving
+				// formant filters, from somewhere close behind or beside you.
+				function whisper() {
+					const t0 = ctx.currentTime;
+					const source = ctx.createBufferSource();
+					source.buffer = noise;
+					source.loop = true;
+					const high = ctx.createBiquadFilter();
+					high.type = "highpass";
+					high.frequency.value = 400;
+					const formants = [ctx.createBiquadFilter(), ctx.createBiquadFilter()];
+					const voice = ctx.createGain();
+					source.connect(high);
+					for (const formant of formants) {
+						formant.type = "bandpass";
+						formant.Q.value = 7;
+						high.connect(formant).connect(voice);
+					}
+					let t = t0;
+					voice.gain.setValueAtTime(0.0001, t);
+					for (let i = 0, syllables = 6 + Math.floor(Math.random() * 10); i < syllables; i++) {
+						const length = 0.07 + Math.random() * 0.13;
+						formants[0].frequency.setValueAtTime(400 + Math.random() * 600, t);
+						formants[1].frequency.setValueAtTime(1100 + Math.random() * 1500, t);
+						voice.gain.exponentialRampToValueAtTime(0.5 + Math.random() * 0.5, t + 0.02);
+						voice.gain.exponentialRampToValueAtTime(0.02, t + length);
+						t += length + (Math.random() < 0.2 ? 0.15 + Math.random() * 0.25 : 0.01);
+					}
+					voice.gain.exponentialRampToValueAtTime(0.0001, t + 0.1);
+					camera.getWorldDirection(facing);
+					const away = Math.atan2(-facing.x, -facing.z) + (Math.random() - 0.5) * 2.4; // mostly behind you
+					const at = camera.position.clone().add(new THREE.Vector3(Math.sin(away) * 2.5, Math.random() * 0.6 - 0.3, Math.cos(away) * 2.5));
+					route(voice, { position: at, wet: 0.5, gain: 0.3, ref: 1.5 });
+					source.start(t0, Math.random() * 1.5);
+					source.stop(t + 0.2);
+				}
+
+				// A church bell somewhere off in the fog, three slow tolls.
+				function bell() {
+					const at = new THREE.Vector3(-40, 10, -90);
+					for (let toll = 0; toll < 3; toll++) {
+						for (const [ratio, peak, decay] of [
+							[0.5, 0.3, 7],
+							[1, 0.25, 5],
+							[1.183, 0.12, 3.5],
+							[1.506, 0.1, 3],
+							[2, 0.08, 2.5],
+							[2.514, 0.05, 2],
+							[2.662, 0.04, 1.8],
+							[3.011, 0.03, 1.4],
+						]) {
+							tone({ position: at, from: 196 * ratio, peak, attack: 0.004, decay, wet: 0.8, ref: 20, delay: toll * 4.2 });
+						}
+					}
+				}
+
+				// Old wood under strain: a rough tone that sticks and slips.
+				function creak(position) {
+					const t = ctx.currentTime;
+					const length = 0.5 + Math.random() * 0.9;
+					const pitch = new Float32Array(24).map((_, i) => 70 + i * 1.5 + Math.random() * 25);
+					const grip = new Float32Array(24).map(() => (Math.random() < 0.7 ? 0.05 + Math.random() * 0.3 : 0.001));
+					grip[0] = grip[23] = 0.0001;
+					const oscillator = ctx.createOscillator();
+					oscillator.type = "sawtooth";
+					oscillator.frequency.setValueCurveAtTime(pitch, t, length);
+					const band = ctx.createBiquadFilter();
+					band.type = "bandpass";
+					band.frequency.value = 850;
+					band.Q.value = 3;
+					const level = ctx.createGain();
+					level.gain.setValueCurveAtTime(grip, t, length);
+					oscillator.connect(band).connect(level);
+					route(level, { position, wet: 0.35, ref: 2.5 });
+					oscillator.start(t);
+					oscillator.stop(t + length + 0.05);
+				}
+
+				// The jump scare: a screeching cluster sliding upward, a blast of noise
+				// and a deep hit, all at once.
+				function scream() {
+					if (!ctx || muted) return;
+					const t = ctx.currentTime;
+					for (const frequency of [520, 553, 741, 1046, 1480]) {
+						const oscillator = ctx.createOscillator();
+						oscillator.type = "sawtooth";
+						oscillator.frequency.setValueAtTime(frequency, t);
+						oscillator.frequency.exponentialRampToValueAtTime(frequency * 1.35, t + 0.7);
+						const level = ctx.createGain();
+						envelope(level.gain, t, 0.16, 0.01, 1.1);
+						oscillator.connect(level);
+						route(level, { wet: 0.4 });
+						oscillator.start(t);
+						oscillator.stop(t + 1.2);
+					}
+					burst({ filter: "highpass", frequency: 1500, peak: 0.9, attack: 0.003, decay: 0.5, wet: 0.4 });
+					tone({ from: 90, to: 30, glide: 0.4, peak: 1, attack: 0.003, decay: 0.6, wet: 0.3 });
+				}
+
+				// The spider swarm: dozens of tiny legs clicking all around you, and a hiss.
+				function skitter() {
+					if (!ctx || muted) return;
+					for (let i = 0; i < 90; i++) {
+						const around = camera.position.clone().add(new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(1.2));
+						burst({ position: around, filter: "bandpass", frequency: 2500 + Math.random() * 3500, q: 4, peak: 0.25 + Math.random() * 0.25, attack: 0.001, decay: 0.012, wet: 0.05, ref: 0.5, delay: Math.random() * 2.2 });
+					}
+					burst({ filter: "highpass", frequency: 4000, peak: 0.4, attack: 0.01, decay: 0.7, wet: 0.3 });
+				}
+
+				// The cauldron boiling over: a heavy gush and a run of big bubbles.
+				function pour() {
+					if (!ctx) return;
+					const t = ctx.currentTime;
+					const source = ctx.createBufferSource();
+					source.buffer = noise;
+					source.loop = true;
+					const low = ctx.createBiquadFilter();
+					low.type = "lowpass";
+					low.frequency.setValueAtTime(250, t);
+					low.frequency.exponentialRampToValueAtTime(700, t + 1);
+					low.frequency.exponentialRampToValueAtTime(220, t + 4);
+					const level = ctx.createGain();
+					level.gain.setValueAtTime(0.0001, t);
+					level.gain.exponentialRampToValueAtTime(0.7, t + 0.4);
+					level.gain.exponentialRampToValueAtTime(0.0001, t + 4.5);
+					source.connect(low).connect(level);
+					route(level, { position: cauldronTop, wet: 0.4, ref: 4 });
+					source.start(t, Math.random());
+					source.stop(t + 4.6);
+					for (let i = 0; i < 12; i++) {
+						const frequency = 80 + Math.random() * 80;
+						tone({ position: cauldronTop, from: frequency, to: frequency * (2.5 + Math.random()), glide: 0.09, peak: 0.6, attack: 0.01, decay: 0.16, wet: 0.4, ref: 4, delay: i * 0.12 + Math.random() * 0.1 });
+					}
+				}
+
+				// Lub-dub, felt more than heard.
+				function heartbeat() {
+					tone({ from: 62, to: 38, glide: 0.1, peak: 0.7, attack: 0.008, decay: 0.18, wet: 0.05 });
+					tone({ from: 55, to: 34, glide: 0.1, peak: 0.45, attack: 0.008, decay: 0.2, wet: 0.05, delay: 0.22 });
+				}
+
+				// A slightly out-of-tune lullaby from the doll, slowing down as if
+				// the spring were running out.
+				function musicBox() {
+					if (!ctx || ctx.currentTime < musicUntil) return;
+					musicUntil = ctx.currentTime + 8;
+					const at = doll.userData.head.getWorldPosition(new THREE.Vector3());
+					let delay = 0;
+					[69, 72, 76, 74, 72, 71, 69, 64, 69].forEach((note, i) => {
+						const wobble = 1 + 0.015 * Math.sin(i * 1.7); // the drum turning unevenly
+						const frequency = 880 * wobble * Math.pow(2, (note - 69 + (Math.random() - 0.5) * 0.7 - i * 0.04) / 12);
+						for (const [ratio, peak] of [
+							[1, 0.12],
+							[3.01, 0.04],
+							[5.4, 0.015],
+						]) {
+							tone({ position: at, from: frequency * ratio, peak, attack: 0.003, decay: 1.4 / ratio, wet: 0.55, ref: 2.5, delay });
+						}
+						delay += 0.4 * Math.pow(1.16, i);
+					});
+				}
+
+				function puff(position) {
+					if (!ctx) return;
+					burst({ position, filter: "bandpass", frequency: 1100, q: 0.8, peak: 0.6, attack: 0.02, decay: 0.35, wet: 0.2, ref: 2 });
+					burst({ position, filter: "highpass", frequency: 3500, peak: 0.12, attack: 0.05, decay: 0.8, wet: 0.3, ref: 2 });
+				}
+
+				// The crickets fall silent while the witch goes over, and a gust
+				// sweeps across.
+				function witchPasses() {
+					if (!ctx) return;
+					const t = ctx.currentTime;
+					hushUntil = t + 10 + Math.random() * 6;
+					const source = ctx.createBufferSource();
+					source.buffer = noise;
+					source.loop = true;
+					const band = ctx.createBiquadFilter();
+					band.type = "bandpass";
+					band.Q.value = 1.2;
+					band.frequency.setValueAtTime(250, t);
+					band.frequency.exponentialRampToValueAtTime(1100, t + 5);
+					band.frequency.exponentialRampToValueAtTime(250, t + 11);
+					const level = ctx.createGain();
+					level.gain.setValueAtTime(0.0001, t);
+					level.gain.exponentialRampToValueAtTime(0.12, t + 5);
+					level.gain.exponentialRampToValueAtTime(0.0001, t + 12);
+					const pan = ctx.createStereoPanner();
+					pan.pan.setValueAtTime(0.9, t);
+					pan.pan.linearRampToValueAtTime(-0.9, t + 12);
+					source.connect(band).connect(level).connect(pan);
+					route(pan, { wet: 0.4 });
+					source.start(t);
+					source.stop(t + 12.5);
+				}
+
+				// Landing sounds, by what landed.
+				const knocks = {
+					wood: (p, s) => {
+						burst({ position: p, filter: "bandpass", frequency: 700, q: 1.2, peak: s, attack: 0.002, decay: 0.08, ref: 2 });
+						tone({ position: p, from: 160, to: 120, glide: 0.08, peak: s * 0.8, attack: 0.002, decay: 0.12, ref: 2 });
+					},
+					pumpkin: (p, s) => {
+						tone({ position: p, from: 95, to: 70, glide: 0.15, peak: s, attack: 0.003, decay: 0.22, ref: 2 });
+						burst({ position: p, filter: "lowpass", frequency: 320, peak: s * 0.8, attack: 0.002, decay: 0.1, ref: 2 });
+					},
+					thud: (p, s) => {
+						burst({ position: p, filter: "lowpass", frequency: 420, peak: s, attack: 0.002, decay: 0.07, ref: 2 });
+						tone({ position: p, from: 140, to: 100, glide: 0.05, peak: s * 0.6, attack: 0.002, decay: 0.07, ref: 2 });
+					},
+					bone: (p, s) => {
+						burst({ position: p, filter: "bandpass", frequency: 1500, q: 2, peak: s, attack: 0.001, decay: 0.05, ref: 2 });
+						tone({ position: p, from: 420, to: 380, glide: 0.05, peak: s * 0.5, attack: 0.002, decay: 0.08, ref: 2 });
+					},
+					glass: (p, s) => {
+						tone({ position: p, from: 2350, peak: s * 0.25, attack: 0.001, decay: 0.6, ref: 2, wet: 0.4 });
+						tone({ position: p, from: 3720, peak: s * 0.15, attack: 0.001, decay: 0.4, ref: 2, wet: 0.4 });
+					},
+					metal: (p, s) => {
+						for (const frequency of [1150, 1730, 2610]) tone({ position: p, from: frequency, peak: s * 0.2, attack: 0.001, decay: 0.35, ref: 2, wet: 0.35 });
+						burst({ position: p, filter: "bandpass", frequency: 900, peak: s * 0.5, attack: 0.001, decay: 0.04, ref: 2 });
+					},
+					squish: (p, s) => {
+						burst({ position: p, filter: "lowpass", frequency: 600, peak: s * 0.8, attack: 0.003, decay: 0.06, ref: 2 });
+						tone({ position: p, from: 300, to: 170, glide: 0.05, peak: s * 0.4, attack: 0.002, decay: 0.05, ref: 2 });
+					},
+					tick: (p, s) => burst({ position: p, filter: "bandpass", frequency: 3200, q: 2, peak: s * 0.7, attack: 0.001, decay: 0.025, ref: 2 }),
+				};
+
+				function impact(object, speed, kind) {
+					if (!ctx || ctx.state !== "running") return;
+					knocks[kind](object.position.clone(), clamp((speed - 1.5) / 10, 0.05, 0.9));
+				}
+
+				function setMuted(value) {
+					muted = value;
+					if (ctx) master.gain.setTargetAtTime(muted ? 0 : 0.9, ctx.currentTime, 0.2);
+					notify();
+				}
+
+				const playing = () => !!ctx && ctx.state === "running" && !muted;
+
+				function update() {
+					if (!ctx || ctx.state !== "running") return;
+					const now = ctx.currentTime;
+
+					// The listener is the camera.
+					camera.getWorldDirection(facing);
+					const listener = ctx.listener;
+					if (listener.positionX) {
+						listener.positionX.value = camera.position.x;
+						listener.positionY.value = camera.position.y;
+						listener.positionZ.value = camera.position.z;
+						listener.forwardX.value = facing.x;
+						listener.forwardY.value = facing.y;
+						listener.forwardZ.value = facing.z;
+						listener.upX.value = 0;
+						listener.upY.value = 1;
+						listener.upZ.value = 0;
+					} else {
+						listener.setPosition(camera.position.x, camera.position.y, camera.position.z);
+						listener.setOrientation(facing.x, facing.y, facing.z, 0, 1, 0);
+					}
+
+					// Wind swells with the same gusts that bend the flames.
+					const windLevel = 0.1 + 0.05 * Math.sin(now * 0.13) + 0.04 * Math.sin(now * 0.37 + 1) + gust * 2.2;
+					wind.level.gain.setTargetAtTime(windLevel, now, 0.4);
+					wind.band.frequency.setTargetAtTime(280 + windLevel * 900, now, 0.5);
+
+					// Crickets: three-pulse chirps, scheduled a little ahead.
+					for (const cricket of crickets) {
+						cricket.next = Math.max(cricket.next, now);
+						while (cricket.next < now + 0.25) {
+							if (cricket.next > hushUntil) {
+								for (let pulse = 0; pulse < 3; pulse++) {
+									const t = cricket.next + pulse * 0.045;
+									cricket.level.gain.setValueAtTime(0, t);
+									cricket.level.gain.linearRampToValueAtTime(1, t + 0.008);
+									cricket.level.gain.linearRampToValueAtTime(0, t + 0.032);
+								}
+							}
+							cricket.next += cricket.period * (0.85 + Math.random() * 0.3) + (Math.random() < 0.05 ? 2 + Math.random() * 3 : 0);
+						}
+					}
+
+					// Lit wicks crackle now and then; you hear the near ones.
+					const litFlames = flames.filter((entry) => entry.on);
+					if (litFlames.length && now > nextCrackle) {
+						const position = litFlames[Math.floor(Math.random() * litFlames.length)].mesh.getWorldPosition(new THREE.Vector3());
+						burst({ position, filter: "highpass", frequency: 2200, peak: 0.15 + Math.random() * 0.35, attack: 0.002, decay: 0.012 + Math.random() * 0.03, wet: 0.08, ref: 1.5 });
+						nextCrackle = now + 0.15 + Math.random() * (2.5 / litFlames.length);
+					}
+
+					// The cauldron bubbles, faster when stirred up.
+					simmer.gain.setTargetAtTime(0.4 + cauldronSurge * 0.4, now, 0.3);
+					if (now > nextBlup) {
+						const frequency = 120 + Math.random() * 160;
+						tone({ position: cauldronTop, from: frequency, to: frequency * (2 + Math.random()), glide: 0.07, peak: 0.5, attack: 0.008, decay: 0.12, wet: 0.35, ref: 4 });
+						nextBlup = now + (0.15 + Math.random() * 0.5) / (1 + cauldronSurge * 2);
+					}
+
+					// An owl in the big tree.
+					if (now > nextOwl) {
+						const at = bigTree.clone().setY(groundY + 15);
+						for (const [delay, length] of [
+							[0, 0.45],
+							[0.75, 0.22],
+							[1.05, 0.5],
+						]) {
+							tone({ position: at, from: 360, to: 330, glide: length, peak: 0.25, attack: 0.06, decay: length, wet: 0.7, ref: 10, delay });
+						}
+						nextOwl = now + 25 + Math.random() * 35;
+					}
+
+					// Bats squeak as they pass.
+					if (flock && now > nextSqueak) {
+						const passing = flock.bats.filter(({ bat }) => bat.visible);
+						if (passing.length) {
+							const { bat } = passing[Math.floor(Math.random() * passing.length)];
+							tone({ position: bat.position.clone(), from: 9000 + Math.random() * 2500, to: 5500, glide: 0.03, peak: 0.12, attack: 0.003, decay: 0.04, wet: 0.2, ref: 3 });
+						}
+						nextSqueak = now + 0.05 + Math.random() * 0.2;
+					}
+
+					// The skull's teeth clatter while its jaw chatters.
+					if (jawChatter > 0 && now - lastChatter > 0.075) {
+						lastChatter = now;
+						burst({ position: skull.position.clone(), filter: "bandpass", frequency: 2600, q: 3, peak: 0.6, attack: 0.001, decay: 0.03, wet: 0.15, ref: 2 });
+					}
+
+					// Every so often, unprompted, the music box.
+					if (now > nextMusicBox) {
+						musicBox();
+						nextMusicBox = now + 80 + Math.random() * 60;
+					}
+
+					// The drone breathes: slowly louder and softer, darker and brighter.
+					drone.level.gain.setTargetAtTime(0.05 + 0.035 * (0.5 + 0.5 * Math.sin(now * 0.07)), now, 2);
+					drone.filter.frequency.setTargetAtTime(150 + 90 * (0.5 + 0.5 * Math.sin(now * 0.05)) + 40 * Math.sin(now * 0.13), now, 2);
+
+					if (now > nextMoan) {
+						moan();
+						nextMoan = now + 12 + Math.random() * 20;
+					}
+					if (now > nextWhisper) {
+						whisper();
+						nextWhisper = now + 45 + Math.random() * 60;
+					}
+					if (now > nextBell) {
+						bell();
+						nextBell = now + 90 + Math.random() * 90;
+					}
+					if (now > nextCreak) {
+						const fromTable = Math.random() < 0.6;
+						creak(fromTable ? new THREE.Vector3(Math.random() * 4 - 2, -0.3, 0) : bigTree.clone().setY(groundY + 12));
+						nextCreak = now + 15 + Math.random() * 30;
+					}
+					// Now and then the crickets all stop at once.
+					if (now > nextSilence) {
+						hushUntil = Math.max(hushUntil, now + 5 + Math.random() * 5);
+						nextSilence = now + 40 + Math.random() * 50;
+					}
+
+					// Inside the pumpkin: muffled, and a heartbeat.
+					const inside = camera.position.distanceTo(pumpkinCenter) < Math.min(W, H) * 0.95;
+					muffle.frequency.setTargetAtTime(inside ? 650 : 18000, now, 0.25);
+					if (inside && now > nextBeat) {
+						heartbeat();
+						nextBeat = now + 1.05;
+					}
+				}
+
+				return { start, update, puff, impact, musicBox, witchPasses, scream, skitter, pour, setMuted, playing, started: () => !!ctx, muted: () => muted, onChange: (fn) => changed.push(fn) };
+			})();
+
+			for (const type of ["pointerdown", "keydown", "touchstart"]) {
+				addEventListener(type, (event) => event.target !== soundButton && !soundButton.contains(event.target) && sounds.start(), { capture: true });
+			}
+
+			// Sound on/off, top right.
+			const SPEAKER = '<path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/>';
+			const WAVES = '<path d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>';
+			const CROSS = '<path d="M16.5 9.5l5 5m0-5l-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>';
+			const soundButton = document.createElement("button");
+			Object.assign(soundButton.style, {
+				position: "fixed",
+				top: "14px",
+				right: "14px",
+				width: "42px",
+				height: "42px",
+				padding: "0",
+				display: "grid",
+				placeItems: "center",
+				borderRadius: "50%",
+				border: "1px solid rgba(255, 190, 120, 0.25)",
+				background: "rgba(12, 10, 8, 0.55)",
+				color: "#e8d2b0",
+				cursor: "pointer",
+				backdropFilter: "blur(4px)",
+			});
+			function updateSoundButton() {
+				const on = sounds.playing();
+				// The drawing spans x 4 to about 22, so shift the view box to center it.
+				soundButton.innerHTML = `<svg width="22" height="22" viewBox="${on ? 0.9 : 1.15} 0 24 24" style="display: block" aria-hidden="true">${SPEAKER}${on ? WAVES : CROSS}</svg>`;
+				soundButton.title = on ? "Mute sound" : "Turn sound on";
+				soundButton.setAttribute("aria-label", soundButton.title);
+			}
+			soundButton.addEventListener("click", () => {
+				if (!sounds.started()) sounds.start();
+				else sounds.setMuted(!sounds.muted());
+			});
+			document.body.appendChild(soundButton);
+			sounds.onChange(updateSoundButton);
+			updateSoundButton();
+
+			// What each thing sounds like when it lands.
+			const impactKinds = new Map([
+				[lidRoot, "pumpkin"],
+				[apple, "thud"],
+				[skull, "bone"],
+				[wineGlass, "glass"],
+				[jarLid, "metal"],
+				...eyeballs.map(({ look }) => [look.parent, "squish"]),
+			]);
+
+			// =====================================================================
+			// The cauldron: stirring, and boiling over
+			// A gnarled stick stirs the potion on its own, faster when it's worked
+			// up. Click it and the potion froths up over the rim and runs down the
+			// sides in glossy rivulets that thin as they stretch and bead where
+			// they slow. Drips fall from the belly of the pot, and a puddle spreads
+			// where each rivulet reaches the ground. Then it drains away and the
+			// puddles shrink back to nothing.
+			// =====================================================================
+
+			// Glowing slime: glossy, with its glow flowing along each rivulet in streaks.
+			const slimeMaterial = new THREE.MeshPhysicalMaterial({
+				color: "#123d10",
+				emissive: "#46ff3c",
+				emissiveIntensity: 0.95,
+				roughness: 0.18,
+				clearcoat: 1,
+				clearcoatRoughness: 0.1,
+				side: THREE.DoubleSide,
+			});
+			// Spread thin on the ground it glows less, and the wet surface shows.
+			const puddleMaterial = new THREE.MeshPhysicalMaterial({
+				color: "#061505",
+				emissive: "#3cff36",
+				emissiveIntensity: 0.32,
+				roughness: 0.1,
+				clearcoat: 1,
+				clearcoatRoughness: 0.05,
+			});
+			slimeMaterial.onBeforeCompile = (shader) => {
+				shader.uniforms.uTime = envTime;
+				shader.vertexShader = shader.vertexShader
+					.replace("#include <common>", "#include <common>\nvarying vec2 vSlime;")
+					.replace("#include <begin_vertex>", "#include <begin_vertex>\nvSlime = uv;");
+				shader.fragmentShader = shader.fragmentShader
+					.replace(
+						"#include <common>",
+						`#include <common>
+						uniform float uTime;
+						varying vec2 vSlime;
+						float slimeHash(vec2 p) {
+							return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+						}
+						float slimeNoise(vec2 p) {
+							vec2 i = floor(p);
+							vec2 f = fract(p);
+							f = f * f * (3.0 - 2.0 * f);
+							return mix(mix(slimeHash(i), slimeHash(i + vec2(1.0, 0.0)), f.x), mix(slimeHash(i + vec2(0.0, 1.0)), slimeHash(i + vec2(1.0, 1.0)), f.x), f.y);
+						}`,
+					)
+					.replace(
+						"#include <emissivemap_fragment>",
+						`#include <emissivemap_fragment>
+						float flow = slimeNoise(vec2(vSlime.x * 14.0 - uTime * 1.6, vSlime.y * 4.0)) * 0.6 + slimeNoise(vec2(vSlime.x * 40.0 - uTime * 2.4, vSlime.y * 9.0)) * 0.4;
+						totalEmissiveRadiance *= 0.45 + 0.9 * flow;`,
+					);
+			};
+
+			// The pot's outside, as [height, radius] pairs (matches its lathe).
+			const potProfile = [
+				[0.2, 0.9],
+				[0.5, 1.4],
+				[1.1, 1.65],
+				[1.7, 1.6],
+				[2.05, 1.35],
+				[2.15, 1.42],
+				[2.26, 1.48],
+			];
+			function potRadius(y) {
+				for (let i = 1; i < potProfile.length; i++) {
+					const [y0, r0] = potProfile[i - 1];
+					const [y1, r1] = potProfile[i];
+					if (y <= y1) return r0 + (r1 - r0) * clamp((y - y0) / (y1 - y0), 0, 1);
+				}
+				return potProfile[potProfile.length - 1][1];
+			}
+
+			// The stirring stick: a crooked branch leaning out over the rim, with a
+			// band of slime where it meets the potion.
+			const stirrer = new THREE.Group();
+			{
+				const curve = new THREE.CatmullRomCurve3(
+					[
+						[0.6, 1.2, 0],
+						[0.62, 1.9, 0.02],
+						[0.7, 2.6, -0.05],
+						[0.84, 3.3, 0.06],
+						[0.95, 3.9, -0.02],
+						[1.08, 4.4, 0.08],
+					].map(([x, y, z]) => new THREE.Vector3(x, y, z)),
+				);
+				const wood = new THREE.MeshStandardMaterial({ color: "#3a2a1b", roughness: 0.95 });
+				const stick = new THREE.Mesh(new THREE.TubeGeometry(curve, 40, 0.07, 8), wood);
+				const knot = new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 6), wood);
+				knot.position.copy(curve.getPointAt(0.62));
+				const coating = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3([0.12, 0.2, 0.28].map((s) => curve.getPointAt(s))), 12, 0.085, 8), slimeMaterial);
+				stirrer.add(stick, knot, coating);
+			}
+			cauldron.add(shadowed(stirrer));
+			let stirAngle = 0;
+
+			// A flattened ribbon of slime swept along a path that hugs the pot:
+			// wide where it pours over the rim, thin where it stretches, beaded
+			// where it slows, and spreading out at the foot.
+			function buildRivulet(points, width) {
+				const curve = new THREE.CatmullRomCurve3(points);
+				const SEGMENTS = 70;
+				const AROUND = 10;
+				const positions = [];
+				const uvs = [];
+				const index = [];
+				const p = new THREE.Vector3();
+				const tangent = new THREE.Vector3();
+				const out = new THREE.Vector3();
+				const across = new THREE.Vector3();
+				const beads = [random(0.35, 0.55), random(0.6, 0.85)];
+				for (let i = 0; i <= SEGMENTS; i++) {
+					const s = i / SEGMENTS;
+					curve.getPointAt(s, p);
+					curve.getTangentAt(s, tangent);
+					out.set(p.x, 0, p.z).normalize(); // away from the pot
+					across.crossVectors(tangent, out).normalize();
+					out.crossVectors(across, tangent).normalize();
+					let w = width * (1.6 - smoothstep(0, 0.25, s) + 0.9 * smoothstep(0.8, 1, s));
+					for (const bead of beads) w *= 1 + 0.55 * Math.exp(-(((s - bead) / 0.03) ** 2));
+					for (let k = 0; k <= AROUND; k++) {
+						const a = (k / AROUND) * TAU;
+						const x = Math.cos(a) * w;
+						const y = Math.sin(a) * w * 0.4; // flat against the pot
+						positions.push(p.x + across.x * x + out.x * y, p.y + across.y * x + out.y * y, p.z + across.z * x + out.z * y);
+						uvs.push(s, k / AROUND);
+					}
+				}
+				for (let i = 0; i < SEGMENTS; i++) {
+					for (let k = 0; k < AROUND; k++) {
+						const a = i * (AROUND + 1) + k;
+						const b = a + AROUND + 1;
+						index.push(a, b, a + 1, a + 1, b, b + 1);
+					}
+				}
+				const geometry = new THREE.BufferGeometry();
+				geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+				geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+				geometry.setIndex(index);
+				geometry.computeVertexNormals();
+				return geometry;
+			}
+
+			// A puddle: lobed, and domed like a drop of something thick.
+			function puddleGeometry() {
+				const phase = random(0, TAU);
+				return displace(new THREE.CircleGeometry(1, 56).rotateX(-Math.PI / 2), (x, y, z) => {
+					const a = Math.atan2(z, x);
+					const k = 1 + 0.16 * Math.sin(a * 3 + phase) + 0.09 * Math.sin(a * 7 + phase * 2);
+					return [x * k, 0.06 * (1 - x * x - z * z), z * k];
+				});
+			}
+
+			rand = mulberry32(9090);
+			const rivulets = Array.from({ length: 9 }, (_, i) => {
+				const angle = random(0, TAU);
+				const wiggle = random(0, TAU);
+				const reach = random(0.25, 0.8);
+				const at = (r, y, around = angle) => new THREE.Vector3(Math.cos(around) * r, y, Math.sin(around) * r);
+				const points = [at(1.2, 2.3), at(1.47, 2.36), at(1.58, 2.25)];
+				for (let y = 2.05; y > 0.35; y -= 0.25) points.push(at(potRadius(y) + 0.035, y, angle + 0.06 * Math.sin(y * 3 + wiggle)));
+				points.push(at(potRadius(0.3) + 0.25, 0.06), at(1.35 + reach, 0.03));
+				const geometry = buildRivulet(points, random(0.06, 0.12));
+				geometry.setDrawRange(0, 0);
+				cauldron.add(new THREE.Mesh(geometry, slimeMaterial));
+				const puddle = new THREE.Mesh(puddleGeometry(), puddleMaterial);
+				puddle.position.set(points[points.length - 1].x, 0.02 + i * 0.002, points[points.length - 1].z);
+				puddle.rotation.y = random(0, TAU);
+				puddle.scale.setScalar(0);
+				cauldron.add(puddle);
+				return { geometry, puddle, angle, size: random(0.4, 0.75), delay: random(0, 0.5), speed: random(0.7, 1.2) };
+			});
+			// One wide pool under the pot that the puddles run into.
+			const basePool = new THREE.Mesh(puddleGeometry(), puddleMaterial);
+			basePool.position.y = 0.015;
+			basePool.scale.setScalar(0);
+			cauldron.add(basePool);
+
+			// Froth bubbling up all around the rim.
+			const froth = Array.from({ length: 36 }, (_, i) => {
+				const a = (i / 36) * TAU + random(-0.08, 0.08);
+				const bubble = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 8), slimeMaterial);
+				const r = random(1.2, 1.46);
+				bubble.position.set(Math.cos(a) * r, 2.32, Math.sin(a) * r);
+				bubble.scale.setScalar(0);
+				cauldron.add(bubble);
+				return { bubble, size: random(0.06, 0.16), phase: random(0, TAU) };
+			});
+
+			// Drips falling from the belly of the pot, where the rivulets run over it.
+			const drips = Array.from({ length: 8 }, () => {
+				const drop = new THREE.Mesh(new THREE.SphereGeometry(1, 8, 6), slimeMaterial);
+				drop.visible = false;
+				cauldron.add(drop);
+				return { drop, wait: Math.random(), velocity: 0, size: 0.04 };
+			});
+
+			let overflow = -1; // seconds since it boiled over; -1 when it's calm
+
+			function boilOver() {
+				overflow = overflow >= 0 && overflow < 5 ? Math.min(overflow, 1.8) : 0; // clicking again keeps it going
+				cauldronSurge = 5;
+				sounds.pour();
+			}
+
+			function updateCauldron(dt) {
+				stirAngle += dt * (1.2 + cauldronSurge * 0.8);
+				stirrer.rotation.set(0.05 * Math.sin(stirAngle * 2), stirAngle, 0.04 * Math.cos(stirAngle * 1.3));
+				if (overflow < 0) return;
+				overflow += dt;
+				const t = overflow;
+				const rise = smoothstep(0, 0.6, t) * (1 - smoothstep(5, 8, t));
+				potion.position.y = 1.95 + 0.42 * rise;
+				potion.scale.setScalar(1 + 0.16 * rise);
+				cauldronSurge = Math.max(cauldronSurge, rise * 1.5);
+				for (const { bubble, size, phase } of froth) {
+					bubble.scale.setScalar(size * rise * (0.8 + 0.3 * Math.sin(t * 6 + phase)));
+					bubble.position.y = 2.3 + 0.05 * rise + 0.03 * Math.sin(t * 4 + phase);
+				}
+				// Each rivulet runs down, then drains away from the top; its puddle
+				// spreads once it arrives and shrinks as it dries up.
+				for (const rivulet of rivulets) {
+					const count = rivulet.geometry.index.count;
+					const run = smoothstep(rivulet.delay, rivulet.delay + 1.4 / rivulet.speed, t);
+					const drain = smoothstep(5, 7.5 + rivulet.delay, t);
+					const start = Math.floor((count * drain) / 3) * 3;
+					rivulet.geometry.setDrawRange(start, Math.max(0, Math.floor((count * run) / 3) * 3 - start));
+					const spread = smoothstep(0.85, 1, run) * smoothstep(0, 1.2, t - rivulet.delay - 1.2 / rivulet.speed);
+					rivulet.puddle.scale.setScalar(rivulet.size * spread * (1 - smoothstep(6.5, 9.5, t)) + 1e-4);
+				}
+				basePool.scale.setScalar(2.1 * smoothstep(1.4, 3, t) * (1 - smoothstep(6.5, 9.5, t)) + 1e-4);
+				for (const drip of drips) {
+					if (!drip.drop.visible) {
+						drip.wait -= dt;
+						if (drip.wait > 0 || rise < 0.5 || t < 1.2) continue;
+						const a = rivulets[randInt(0, rivulets.length - 1)].angle + random(-0.05, 0.05);
+						const r = potRadius(1.1) + 0.05;
+						drip.drop.position.set(Math.cos(a) * r, 1.1, Math.sin(a) * r);
+						drip.velocity = 0;
+						drip.size = random(0.03, 0.05);
+						drip.drop.visible = true;
+					} else {
+						drip.velocity -= 30 * dt; // thick stuff falls a little lazily
+						drip.drop.position.y += drip.velocity * dt;
+						drip.drop.scale.set(drip.size, drip.size * (1 + Math.min(2, -drip.velocity * 0.15)), drip.size);
+						if (drip.drop.position.y < 0.05) {
+							drip.drop.visible = false;
+							drip.wait = random(0.1, 0.6);
+						}
+					}
+				}
+				if (t > 9.5) {
+					overflow = -1;
+					potion.position.y = 1.95;
+					potion.scale.setScalar(1);
+				}
+			}
+
+			// =====================================================================
+			// The jump scare
+			// The doll: click her and she blinks and her music box plays; click her
+			// a third time and she comes straight at you, then it starts over.
+			// And one of the spiders (which one depends on the seed) comes at you
+			// every time. The other creatures just react to being clicked.
+			// =====================================================================
+
+			// Lights the creature's face as it reaches you. It's always there (at
+			// zero) so turning it on doesn't make every material recompile.
+			const scareLight = new THREE.PointLight("#ffd6b8", 0, 4, 2);
+			scareLight.position.set(0, 0.25, 0.1);
+			camera.add(scareLight);
+			scene.add(camera);
+
+			// How the doll is posed for her lunge: how big, which point of her ends
+			// up in your face, how close she stops, and what to change on the copy.
+			const scarePoses = {
+				doll: { scale: 0.8, stop: 0.85, aim: new THREE.Vector3(0, 1.06, 0.1), pose: (copy) => copy.children[doll.children.indexOf(doll.userData.head)].rotation.set(0.25, 0, 0.35) },
+			};
+
+			let scare = null; // { rig, source, time }
+
+			function jumpScare(kind, source) {
+				if (scare || swarm) return;
+				const { scale, aim, turn = 0, pose, stop } = scarePoses[kind];
+				const copy = source.clone(true);
+				copy.visible = true;
+				copy.position.copy(aim).multiplyScalar(-scale);
+				copy.rotation.set(0, turn, 0);
+				if (turn) copy.position.applyAxisAngle(new THREE.Vector3(0, 1, 0), turn);
+				copy.scale.setScalar(scale);
+				copy.traverse((child) => (child.castShadow = false));
+				pose?.(copy, source);
+				const rig = new THREE.Group();
+				rig.add(copy);
+				scene.add(rig);
+				source.visible = false; // it's not where it was any more
+				scare = { rig, source, time: 0, stop };
+				sounds.scream();
+			}
+
+			function updateScare(dt) {
+				if (!scare) return;
+				scare.time += dt;
+				const t = scare.time;
+				const calm = smoothstep(0.35, 1.1, t);
+				// Appear a little way off, then rush in, faster and faster.
+				const approach = smoothstep(0.06, 0.32, t);
+				camera.getWorldDirection(_v);
+				scare.rig.position
+					.copy(camera.position)
+					.addScaledVector(_v, 2.6 - (2.6 - scare.stop) * approach * approach)
+					.add(new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, 0).multiplyScalar(0.06 * (1 - calm)));
+				scare.rig.lookAt(camera.position);
+				scare.rig.rotateZ((Math.random() - 0.5) * 0.2 * (1 - calm));
+				// A flash, then the lamp and the film stutter.
+				scareLight.intensity = t < 1.1 ? (Math.random() < 0.5 ? 9 : 2.5) : 0;
+				grade.uniforms.uFlicker.value = t < 0.06 ? 2.2 : t < 1.1 ? 0.65 + Math.random() * 0.8 : grade.uniforms.uFlicker.value;
+				if (t < 1.1) grade.uniforms.uWeave.value.set((Math.random() - 0.5) * 0.02 * (1 - calm), (Math.random() - 0.5) * 0.02 * (1 - calm));
+				if (t > 1.15) {
+					scene.remove(scare.rig);
+					scare.source.visible = true;
+					scareLight.intensity = 0;
+					scare = null;
+				}
+			}
+
+			// The scary spider doesn't lunge. It drops down on its thread right in
+			// front of your face, bounces and twitches there, while dozens more
+			// pour across your view, then it shoots back up.
+			let swarm = null; // { group, big, legs, thread, crawlers, source, time }
+
+			function spiderSwarm(source) {
+				if (swarm || scare) return;
+				const group = new THREE.Group();
+				camera.add(group); // everything here is placed relative to your view
+				const copy = (scale) => {
+					const spider = source.clone(true);
+					spider.visible = true;
+					spider.position.set(0, 0, 0);
+					spider.rotation.set(Math.PI / 2, 0, 0); // back toward you, head down
+					spider.scale.setScalar(scale);
+					spider.traverse((child) => (child.castShadow = false));
+					return spider;
+				};
+				const legsOf = (spider) => spider.children.filter((child) => child.isGroup);
+				const big = new THREE.Group();
+				const bigSpider = copy(0.62);
+				big.add(bigSpider);
+				const thread = new THREE.Line(
+					new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+					new THREE.LineBasicMaterial({ color: "#d8dade", transparent: true, opacity: 0.6 }),
+				);
+				group.add(big, thread);
+				const crawlers = Array.from({ length: 40 }, () => {
+					const holder = new THREE.Group();
+					const spider = copy(0.16 + Math.random() * 0.14);
+					holder.add(spider);
+					group.add(holder);
+					// In from just outside an edge, across and out the other side.
+					const edge = Math.random() * TAU;
+					holder.position.set(Math.cos(edge) * 0.42, Math.sin(edge) * 0.27, -0.6 - Math.random() * 0.1);
+					const heading = new THREE.Vector3(-holder.position.x + (Math.random() - 0.5) * 0.5, -holder.position.y + (Math.random() - 0.5) * 0.4, 0).normalize();
+					holder.rotation.z = Math.atan2(heading.x, -heading.y);
+					holder.visible = false;
+					return { holder, legs: legsOf(spider), velocity: heading.multiplyScalar(0.25 + Math.random() * 0.25), delay: Math.random() * 0.6, gait: Math.random() * TAU };
+				});
+				source.visible = false;
+				swarm = { group, big, legs: legsOf(bigSpider), thread, crawlers, source, time: 0 };
+				sounds.skitter();
+			}
+
+			function updateSpiderSwarm(dt) {
+				if (!swarm) return;
+				swarm.time += dt;
+				const t = swarm.time;
+				const drop = t < 0.2 ? 1 - (t / 0.2) ** 2 : 0;
+				const bounce = t >= 0.2 ? Math.exp(-(t - 0.2) * 5) * Math.sin((t - 0.2) * 22) * 0.04 : 0;
+				const leave = smoothstep(2.2, 2.6, t);
+				swarm.big.position.set(Math.sin(t * 2.3) * 0.015, 0.04 + drop * 0.35 + bounce + leave * 0.45, -0.45);
+				swarm.big.rotation.z = Math.sin(t * 3.1) * 0.15;
+				const thread = swarm.thread.geometry.attributes.position;
+				thread.setXYZ(0, swarm.big.position.x * 0.2, 0.6, -0.45);
+				thread.setXYZ(1, swarm.big.position.x, swarm.big.position.y + 0.02, -0.45);
+				thread.needsUpdate = true;
+				swarm.legs.forEach((hip, i) => (hip.rotation.y = Math.sin(t * 30 + i) * 0.35)); // twitching
+				for (const crawler of swarm.crawlers) {
+					crawler.holder.visible = t > crawler.delay;
+					if (!crawler.holder.visible) continue;
+					crawler.holder.position.addScaledVector(crawler.velocity, dt);
+					crawler.gait += dt * 30;
+					crawler.legs.forEach((hip, i) => (hip.rotation.y = 0.3 * Math.sin(crawler.gait + (i % 2) * Math.PI)));
+				}
+				scareLight.intensity = t < 2.2 ? (Math.random() < 0.3 ? 5 : 1.5) : 0;
+				if (t < 0.12) grade.uniforms.uFlicker.value = 1.7;
+				if (t > 2.7) {
+					camera.remove(swarm.group);
+					swarm.source.visible = true;
+					scareLight.intensity = 0;
+					swarm = null;
+				}
+			}
+
+			// What they do when clicked (and what the doll does the first two times).
+			const reactions = {
+				cat: () => (catState.pause = Math.max(catState.pause, 4)), // stops and stares
+				witch: () => sounds.witchPasses(),
+				vulture: () => (vulture.userData.spread = 3),
+				bat: (roost) => roost && startle(roost), // a roosting bat takes off
+				spider: (spider) => {
+					if (spider.mode !== "walk") return;
+					spider.timer = 0; // scuttle off somewhere else
+					spider.target = tablePoint();
+				},
+				doll: () => {
+					doll.userData.blink = 1;
+					sounds.musicBox();
+				},
+			};
+
+			let dollClicks = 0;
+			const scarySpider = spiders[Math.floor(mulberry32(settings.seed + 13)() * spiders.length)];
+			function creatureClicked(kind, object, extra) {
+				const scares = (kind === "doll" && ++dollClicks % 3 === 0) || (kind === "spider" && extra === scarySpider);
+				if (scares && kind === "spider") spiderSwarm(object);
+				else if (scares) jumpScare(kind, object);
+				else reactions[kind](extra);
+			}
+
+			// Generous invisible targets, since most of them are small, far off or moving.
+			function makeClickable(kind, object, radius, at, extra) {
+				const target = clickTarget(radius);
+				target.position.copy(at);
+				object.add(target);
+				interactives.push({ object, onClick: () => creatureClicked(kind, object, extra) });
+				pickables.push(object);
+			}
+			makeClickable("cat", cat, 1.6, new THREE.Vector3(0, 1.4, 0.4));
+			makeClickable("witch", witch, 2.5, new THREE.Vector3(0, 1.2, 0));
+			makeClickable("vulture", vulture, 2, new THREE.Vector3(0, 1.8, 0.2));
+			[...flockBats, ...treeBats].forEach((bat) => makeClickable("bat", bat, 0.7, new THREE.Vector3()));
+			roosts.forEach((roost) => makeClickable("bat", roost.bat, 0.9, new THREE.Vector3(), roost));
+			spiders.forEach((spider) => makeClickable("spider", spider.object, 0.2, new THREE.Vector3(0, 0.05, 0), spider));
+			interactives.find((entry) => entry.object === doll).onClick = () => creatureClicked("doll", doll);
+
+			// =====================================================================
 			// Hint
 			// =====================================================================
 
@@ -3973,7 +5819,8 @@
 			const flameWorld = new THREE.Vector3();
 
 			function animate() {
-				const dt = Math.min(clock.getDelta(), 0.05);
+				const rawDt = clock.getDelta();
+				const dt = Math.min(rawDt, 0.05);
 				const t = clock.elapsedTime;
 
 				if (Math.random() < dt * 0.25) {
@@ -4020,7 +5867,15 @@
 				camera.updateProjectionMatrix();
 
 				starMaterial.uniforms.uTime.value = t;
-				renderer.render(scene, camera);
+				skyTime.value = t;
+				updateContactShadows();
+				sounds.update();
+				adaptQuality(rawDt, t);
+				updateFilm(dt);
+				updateCauldron(dt);
+				updateScare(dt); // after the film, so its flash and shake win
+				updateSpiderSwarm(dt);
+				composer.render(dt);
 			}
 
 			// =====================================================================
@@ -4035,6 +5890,9 @@
 				camera.fov = aspect < 1 ? Math.min(75, THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(19)) / aspect))) : 38;
 				camera.updateProjectionMatrix();
 				renderer.setSize(width, height, false);
+				composer.setPixelRatio(renderer.getPixelRatio());
+				composer.setSize(width, height);
+				grade.uniforms.uResolution.value.set(width * renderer.getPixelRatio(), height * renderer.getPixelRatio());
 				// Smoke particles size themselves in world units.
 				pointScale.value = (height * renderer.getPixelRatio()) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
 			}
