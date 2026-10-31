@@ -4380,8 +4380,8 @@
 			// side to side and turns back well before it gets around the pumpkin.
 			// =====================================================================
 
-			const SWING = 1.1; // how far you can orbit to either side (radians)
-			const SWEEP = 0.33; // how far the idle drift goes
+			const SWING = 0.65; // how far you can orbit to either side (radians)
+			const SWEEP = 0.26; // how far the idle drift goes
 			controls.minAzimuthAngle = turn - SWING;
 			controls.maxAzimuthAngle = turn + SWING;
 			controls.target.copy(pumpkinCenter).y *= 0.95;
@@ -5791,7 +5791,7 @@
 
 			const hint = document.createElement("div");
 			hint.textContent =
-				innerWidth < 600 ? "drag to look · pinch to move in · tap a flame" : "drag to look around · scroll or pinch to move in · drag things on the table · click or tap a flame";
+				innerWidth < 600 ? "Drag to Look · Pinch to Move In · Tap a Flame" : "Drag to Look Around · Scroll or Pinch to Move In · Drag Things on the Table · Click or Tap a Flame";
 			Object.assign(hint.style, {
 				position: "fixed",
 				bottom: "14px",
