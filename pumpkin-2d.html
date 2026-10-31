@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>pumpkin.js</title>
+	</head>
+	<body>
+		<script>
+			const random = (min, max) => min + Math.random() * (max - min);
+
+			// Body
+			const body = document.body;
+
+			Object.assign(body.style, {
+				boxSizing: "border-box",
+				margin: "0",
+				padding: "30px",
+				backgroundColor: "black",
+				position: "relative",
+				minHeight: "100dvh",
+				width: "100%",
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
+			});
+
+			// Stars
+			for (let i = 0; i < 200; i++) {
+				const star = document.createElement("div");
+				const size = random(1, 4);
+
+				Object.assign(star.style, {
+					position: "absolute",
+					top: `${random(0, 100)}%`,
+					left: `${random(0, 99)}%`,
+					backgroundColor: "white",
+					width: `${size}px`,
+					height: `${size}px`,
+					borderRadius: "50%",
+					pointerEvents: "none",
+				});
+
+				body.appendChild(star);
+			}
+
+			// Pumpkin container
+			const pumpkin = document.createElement("div");
+
+			Object.assign(pumpkin.style, {
+				marginTop: "60px",
+				width: "100%",
+				maxWidth: "600px",
+				aspectRatio: "5 / 4",
+				position: "relative",
+				zIndex: "1",
+			});
+
+			const svgNS = "http://www.w3.org/2000/svg";
+			const svg = document.createElementNS(svgNS, "svg");
+
+			svg.setAttribute("viewBox", "0 0 600 480");
+
+			Object.assign(svg.style, {
+				display: "block",
+				width: "100%",
+				height: "100%",
+				overflow: "visible",
+			});
+
+			// Shared pumpkin measurements
+			const centerX = 300;
+			const centerY = 235;
+			const radiusX = 294;
+			const radiusY = 230;
+
+			// Stem, shadow, and grooves all use this anchor.
+			const rootX = 305;
+			const rootY = 45;
+
+			// Randomized ribs
+			const ribCount = Math.floor(random(7, 10));
+
+			const dents = Array.from({ length: ribCount - 1 }, (_, i) => ({
+				angle: ((i + 1) / ribCount) * Math.PI + random(-0.025, 0.025),
+				depth: random(0.02, 0.045),
+				width: random(0.045, 0.075),
+			}));
+
+			// Calculate any point on the pumpkin outline.
+			function edgePoint(angle) {
+				let scale = 1;
+
+				for (const dent of dents) {
+					const distance = (angle - dent.angle) / dent.width;
+
+					scale -= dent.depth * Math.exp(-0.5 * distance * distance);
+				}
+
+				return {
+					x: centerX + Math.cos(angle) * radiusX * scale,
+					y: centerY + Math.sin(angle) * radiusY * scale,
+				};
+			}
+
+			// Include the exact groove angles in the outline.
+			const outlineAngles = Array.from(
+				{ length: 720 },
+				(_, i) => (i / 720) * Math.PI * 2,
+			);
+
+			outlineAngles.push(...dents.map((dent) => dent.angle));
+			outlineAngles.sort((a, b) => a - b);
+
+			const outlinePath =
+				outlineAngles
+					.map((angle, i) => {
+						const point = edgePoint(angle);
+						return `${i === 0 ? "M" : "L"} ${point.x} ${point.y}`;
+					})
+					.join(" ") + " Z";
+
+			const clipId = `pumpkin-${Math.random().toString(36).slice(2)}`;
+
+			svg.innerHTML = `
+				<defs>
+					<clipPath id="${clipId}" clipPathUnits="userSpaceOnUse">
+						<path d="${outlinePath}" />
+					</clipPath>
+				</defs>
+
+				<path d="${outlinePath}" fill="orange" />
+			`;
+
+			// Grooves
+			const grooves = document.createElementNS(svgNS, "g");
+			grooves.setAttribute("clip-path", `url(#${clipId})`);
+
+			function addGroove(pathData) {
+				const path = document.createElementNS(svgNS, "path");
+
+				path.setAttribute("d", pathData);
+				path.setAttribute("fill", "none");
+				path.setAttribute("stroke", "#b85c00");
+				path.setAttribute("stroke-width", random(1.8, 3));
+				path.setAttribute("stroke-opacity", "0.4");
+				path.setAttribute("stroke-linecap", "round");
+
+				grooves.appendChild(path);
+			}
+
+			// Front grooves end at the calculated outline dents.
+			for (const dent of dents) {
+				const end = edgePoint(dent.angle);
+				const spread = Math.cos(dent.angle);
+
+				const startX = rootX + spread * 23;
+				const startY = rootY + random(7, 13);
+
+				addGroove(`
+					M ${startX} ${startY}
+					C ${rootX + spread * 160} ${rootY + random(10, 25)},
+					  ${end.x + spread * 22}
+					  ${startY + (end.y - startY) * random(0.55, 0.72)},
+					  ${end.x} ${end.y}
+				`);
+			}
+
+			// Short grooves across the back of the pumpkin.
+			// Back grooves: curve over the shoulders without crossing the front.
+			for (let i = 1; i <= 5; i++) {
+				const angle = Math.PI + (i / 6) * Math.PI + random(-0.03, 0.03);
+
+				const end = edgePoint(angle);
+				const horizontal = Math.cos(angle);
+				const vertical = Math.sin(angle);
+
+				// Start along the back edge of the shadow.
+				const startX = rootX + horizontal * 28;
+				const startY = rootY + vertical * 10;
+
+				// Leave the shadow upward and outward.
+				const control1X = startX + horizontal * random(65, 90);
+				const control1Y = startY - random(22, 32);
+
+				// Approach the outline from inside the ellipse.
+				// Its normal determines the direction, keeping the curve rounded.
+				let normalX = horizontal / radiusX;
+				let normalY = vertical / radiusY;
+				const normalLength = Math.hypot(normalX, normalY);
+
+				normalX /= normalLength;
+				normalY /= normalLength;
+
+				const approach = random(25, 40);
+				const control2X = end.x - normalX * approach;
+				const control2Y = end.y - normalY * approach;
+
+				addGroove(`
+		M ${startX} ${startY}
+		C ${control1X} ${control1Y},
+		  ${control2X} ${control2Y},
+		  ${end.x} ${end.y}
+	`);
+			}
+
+			svg.appendChild(grooves);
+
+			// Stem shadow
+			const shadow = document.createElementNS(svgNS, "ellipse");
+
+			shadow.setAttribute("cx", rootX);
+			shadow.setAttribute("cy", rootY);
+			shadow.setAttribute("rx", random(43, 56));
+			shadow.setAttribute("ry", random(12, 17));
+			shadow.setAttribute("fill", "black");
+			shadow.setAttribute("opacity", random(0.2, 0.3));
+			shadow.setAttribute(
+				"transform",
+				`rotate(${random(-8, 8)} ${rootX} ${rootY})`,
+			);
+
+			svg.appendChild(shadow);
+
+			// Randomized stem
+			const stem = document.createElementNS(svgNS, "g");
+
+			// Move the stem's local base directly onto the shadow.
+			stem.setAttribute(
+				"transform",
+				`translate(${rootX - 85} ${rootY - 135})`,
+			);
+
+			const baseX = 85;
+			const baseY = 135;
+			const height = random(75, 115);
+			const halfWidth = random(9, 15);
+			const lean = random(-20, 20);
+			const bend = random(-15, 15);
+			const tipX = baseX + lean;
+			const tipY = baseY - height;
+
+			const stemShape = `
+				M ${baseX - halfWidth - 5} ${baseY}
+				C ${baseX - halfWidth + bend} ${baseY - height * 0.3},
+				  ${tipX - halfWidth + bend} ${tipY + height * 0.3},
+				  ${tipX - halfWidth} ${tipY}
+				L ${tipX - halfWidth * 0.3} ${tipY - random(1, 5)}
+				L ${tipX + halfWidth * 0.4} ${tipY + random(0, 4)}
+				L ${tipX + halfWidth} ${tipY - random(0, 3)}
+				C ${tipX + halfWidth + bend} ${tipY + height * 0.3},
+				  ${baseX + halfWidth + bend} ${baseY - height * 0.3},
+				  ${baseX + halfWidth + 5} ${baseY}
+				Q ${baseX} ${baseY + 5},
+				  ${baseX - halfWidth - 5} ${baseY}
+				Z
+			`;
+
+			// Curly tendrils
+			function makeCurl(direction) {
+				const reach = random(40, 65);
+				const rise = random(20, 45);
+				const radius = random(7, 12);
+				const startX = baseX + direction * halfWidth;
+				const startY = baseY - random(7, 14);
+				const curlX = baseX + direction * reach;
+				const curlY = startY - rise;
+
+				return `
+					M ${startX} ${startY}
+					C ${startX + direction * 25} ${startY + random(-5, 5)},
+					  ${curlX - direction * 25} ${curlY - 12},
+					  ${curlX} ${curlY - radius}
+					C ${curlX + direction * radius * 2} ${curlY - radius},
+					  ${curlX + direction * radius * 2} ${curlY + radius},
+					  ${curlX} ${curlY + radius}
+					C ${curlX - direction * radius} ${curlY + radius},
+					  ${curlX - direction * radius} ${curlY},
+					  ${curlX} ${curlY}
+				`;
+			}
+
+			stem.innerHTML = `
+				<g
+					fill="none"
+					stroke="olivedrab"
+					stroke-width="${random(1.5, 2.5)}"
+					stroke-linecap="round"
+				>
+					<path d="${makeCurl(-1)}" />
+					<path d="${makeCurl(1)}" />
+				</g>
+
+				<path d="${stemShape}" fill="olive" />
+			`;
+
+			svg.appendChild(stem);
+			pumpkin.appendChild(svg);
+			body.appendChild(pumpkin);
+		</script>
+	</body>
+</html>
