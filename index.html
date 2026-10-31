@@ -1,31 +1,81 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>pumpkin.js</title>
-  </head>
-  <body></body>
-  <script>
-    const body = document.querySelector("body");
-    body.style.backgroundColor = "black";
-    const starCount = 100;
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>pumpkin.js</title>
+	</head>
+	<body></body>
+	<script>
+		// Body
+		const body = document.querySelector("body");
+		body.style.boxSizing = "border-box";
+		body.style.margin = "0";
+		body.style.padding = "30px";
+		body.style.backgroundColor = "black";
+		body.style.position = "relative";
+		body.style.height = "100dvh";
+		body.style.width = "100%";
+		body.style.display = "flex";
+		body.style.alignItems = "center";
+		body.style.justifyContent = "center";
 
-    // Stars
-    for (let i = 0; i < starCount; i++) {
-      const star = document.createElement("div");
-      const starSize = Math.random() * 10;
-      const starX = Math.random() * 100;
-      const starY = Math.random() * 100;
-      star.style.transform = `translateX(${starX}%) translateY(${starY})`;
-      star.backgroundColor = "white";
-      star.style.width = `${starSize}px`;
-      star.style.height = `${starSize}px`;
-      body.appendChild(star);
-    }
+		// Stars
+		const starCount = 200;
+		for (let i = 0; i < starCount; i++) {
+			const star = document.createElement("div");
+			const starSize = Math.random() * 4;
+			const starX = Math.random() * 100;
+			const starY = Math.random() * 100;
+			star.style.position = "absolute";
+			star.style.top = `${starY}%`;
+			star.style.left = `${starX}%`;
+			star.style.backgroundColor = "white";
+			star.style.width = `${starSize}px`;
+			star.style.aspectRatio = "1/1";
+			star.style.borderRadius = `${starSize / 2}px`;
+			body.appendChild(star);
+		}
 
-    const pumpkin = document.createElement("div");
+		// Pumpkin
+		const pumpkin = document.createElement("div");
+		pumpkin.style.marginTop = "25px";
+		pumpkin.style.width = "100%";
+		pumpkin.style.maxWidth = "600px";
+		pumpkin.style.aspectRatio = "5/4";
+		pumpkin.style.backgroundColor = "orange";
+		pumpkin.style.zIndex = "999";
+		pumpkin.style.borderRadius = "52% 47% 55% 47%";
+		pumpkin.style.position = "relative";
 
-    body.appendChild(pumpkin);
-  </script>
+		// Pumpkin - Stem
+		const stem = document.createElement("div");
+		stem.style.backgroundColor = "green";
+		stem.style.height = "150px";
+		stem.style.width = "50px";
+		stem.style.borderRadius = "64% 23% 28% 20%";
+		stem.style.position = "absolute";
+		stem.style.top = "-100px";
+		stem.style.left = "50%";
+		stem.style.left = "50%";
+		stem.style.transform = "translateX(calc(-50% + 20px)) rotate(10deg)";
+		stem.style.zIndex = "999";
+		pumpkin.appendChild(stem);
+
+		// Pumpkin - Stem - Shadow
+		const stemShadow = document.createElement("div");
+		stemShadow.style.backgroundColor = "black";
+		stemShadow.style.height = "30px";
+		stemShadow.style.width = "100px";
+		stemShadow.style.opacity = "0.25";
+		stemShadow.style.position = "absolute";
+		stemShadow.style.borderRadius = "62% 43% 72% 51%";
+		stemShadow.style.top = "30px";
+		stemShadow.style.left = "50%";
+		stemShadow.style.transform =
+			"translateX(calc(-50% + 5px)) rotate(5deg)";
+		pumpkin.appendChild(stemShadow);
+
+		body.appendChild(pumpkin);
+	</script>
 </html>
