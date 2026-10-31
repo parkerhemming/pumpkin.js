@@ -8,7 +8,8 @@
 			{
 				"imports": {
 					"three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-					"three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+					"three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+					"rapier": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/rapier.es.js"
 				}
 			}
 		</script>
@@ -17,8 +18,16 @@
 		<script type="module">
 			import * as THREE from "three";
 			import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+			import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+			import RAPIER from "rapier";
 
 			const TAU = Math.PI * 2;
+			const clamp = (x, min, max) => Math.min(max, Math.max(min, x));
+			const smoothstep = (a, b, x) => {
+				const t = clamp((x - a) / (b - a), 0, 1);
+				return t * t * (3 - 2 * t);
+			};
+			const wrapAngle = (a) => a - TAU * Math.round(a / TAU);
 
 			// =====================================================================
 			// Seeded randomness
@@ -36,7 +45,6 @@
 			let rand = mulberry32(1);
 			const random = (min, max) => min + rand() * (max - min);
 			const randInt = (min, max) => Math.floor(random(min, max + 1));
-			const randomSeed = () => Math.floor(Math.random() * 1e9) + 1;
 
 			// Smooth 2D value noise for textures and warping.
 			// `period` makes it wrap in x, for textures that go all the way around.
@@ -74,22 +82,6 @@
 				return [canvas, canvas.getContext("2d", { willReadFrequently: true })];
 			}
 
-			// Fills a canvas pixel by pixel. paint(x, y) returns [r, g, b].
-			function paintPixels(ctx, width, height, paint) {
-				const image = ctx.createImageData(width, height);
-				for (let y = 0; y < height; y++) {
-					for (let x = 0; x < width; x++) {
-						const [r, g, b] = paint(x, y);
-						const i = (y * width + x) * 4;
-						image.data[i] = r;
-						image.data[i + 1] = g;
-						image.data[i + 2] = b;
-						image.data[i + 3] = 255;
-					}
-				}
-				ctx.putImageData(image, 0, 0);
-			}
-
 			function colorTexture(canvas) {
 				const texture = new THREE.CanvasTexture(canvas);
 				texture.colorSpace = THREE.SRGBColorSpace;
@@ -97,42 +89,54 @@
 				return texture;
 			}
 
+			function dataTexture(canvas) {
+				const texture = new THREE.CanvasTexture(canvas);
+				texture.anisotropy = 8;
+				return texture;
+			}
+
+			// Several same-sized canvases painted pixel by pixel in one pass.
+			// paint(x, y, out) fills out[i] = [r, g, b] for each canvas (0..255).
+			function paintCanvases(width, height, count, paint) {
+				const canvases = Array.from({ length: count }, () => makeCanvas(width, height));
+				const images = canvases.map(([, ctx]) => ctx.createImageData(width, height));
+				const out = Array.from({ length: count }, () => [0, 0, 0]);
+				for (let y = 0; y < height; y++) {
+					for (let x = 0; x < width; x++) {
+						paint(x, y, out);
+						const i = (y * width + x) * 4;
+						for (let c = 0; c < count; c++) {
+							images[c].data[i] = out[c][0];
+							images[c].data[i + 1] = out[c][1];
+							images[c].data[i + 2] = out[c][2];
+							images[c].data[i + 3] = 255;
+						}
+					}
+				}
+				canvases.forEach(([, ctx], c) => ctx.putImageData(images[c], 0, 0));
+				return canvases;
+			}
+
 			// =====================================================================
 			// Settings
-			// The URL keeps the seed and face (#seed=777&face=spooky), so a pumpkin
-			// can be shared or recreated. Width and height come from the seed until
-			// a slider changes them.
+			// No on-screen controls. The URL can still pick a pumpkin:
+			// #seed=777&face=spooky (faces: classic, goofy, spooky, surprised).
 			// =====================================================================
 
 			const FACE_NAMES = ["classic", "goofy", "spooky", "surprised"];
 			const hashParams = new URLSearchParams(location.hash.slice(1));
-
 			const settings = {
-				seed: parseInt(hashParams.get("seed") ?? location.hash.slice(1)) || randomSeed(),
+				seed: parseInt(hashParams.get("seed") ?? location.hash.slice(1)) || Math.floor(Math.random() * 1e9) + 1,
 				face: FACE_NAMES.includes(hashParams.get("face")) ? hashParams.get("face") : "classic",
-				width: 1,
-				height: 0.73,
-				grooves: 1,
-				brightness: 1,
 				candleLit: true,
-				lidOff: false,
-				autoRotate: true,
-				wireframe: false,
 			};
-
-			function saveToURL() {
-				history.replaceState(null, "", `#seed=${settings.seed}&face=${settings.face}`);
-			}
+			history.replaceState(null, "", `#seed=${settings.seed}&face=${settings.face}`);
 
 			// =====================================================================
 			// Renderer, camera, controls
 			// =====================================================================
 
-			Object.assign(document.body.style, {
-				margin: "0",
-				overflow: "hidden",
-				backgroundColor: "black",
-			});
+			Object.assign(document.body.style, { margin: "0", overflow: "hidden", backgroundColor: "black" });
 
 			const renderer = new THREE.WebGLRenderer({ antialias: true });
 			renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -141,25 +145,18 @@
 			renderer.toneMapping = THREE.NeutralToneMapping;
 			renderer.toneMappingExposure = 1.1;
 			// Fixed to the viewport so the canvas can never widen the page on phones.
-			Object.assign(renderer.domElement.style, {
-				position: "fixed",
-				inset: "0",
-				width: "100%",
-				height: "100%",
-			});
+			Object.assign(renderer.domElement.style, { position: "fixed", inset: "0", width: "100%", height: "100%" });
 			document.body.appendChild(renderer.domElement);
 
 			const scene = new THREE.Scene();
-			const camera = new THREE.PerspectiveCamera(40, 1, 0.02, 200);
-			camera.position.set(0.5, 1.6, 4.4);
-
+			const camera = new THREE.PerspectiveCamera(38, 1, 0.01, 600);
 			const controls = new OrbitControls(camera, renderer.domElement);
 			controls.enableDamping = true;
 			controls.enablePan = false;
-			controls.minDistance = 1.9;
+			controls.minDistance = 0.15; // close enough to end up inside the pumpkin
 			controls.maxDistance = 9;
-			controls.maxPolarAngle = Math.PI * 0.48; // stay above the tabletop
-			controls.autoRotateSpeed = 0.5;
+			controls.minPolarAngle = 0.12 * Math.PI;
+			controls.maxPolarAngle = 0.49 * Math.PI;
 
 			// =====================================================================
 			// Pumpkin shape
@@ -168,62 +165,96 @@
 			// from surfacePoint(u, v).
 			// =====================================================================
 
-			const SHELL = 0.07; // wall thickness
+			const SHELL = 0.11; // wall thickness (about 1.5 cm on a 30 cm pumpkin)
 
-			// Rolled from the seed by rollShape().
-			let ribs, lumps, topDimple, bottomDimple, lidV, lidTeeth, lidJag, lidTilt, COLS, faceV, turn, noise;
+			rand = mulberry32(settings.seed);
+			const W = random(0.95, 1.06); // half-width
+			const D = W * random(0.92, 1.0); // half-depth: pumpkins are rarely perfectly round
+			const H = random(0.68, 0.77); // half-height
+			const lean = { x: random(-0.05, 0.05), z: random(-0.05, 0.05) };
 
-			function rollShape() {
-				rand = mulberry32(settings.seed);
-				settings.width = random(0.95, 1.1);
-				settings.height = random(0.66, 0.8);
-
-				// Randomized ribs: the same Gaussian dents as the 2D version, now all
-				// the way around, and each groove drifts a little as it goes down.
-				const ribCount = randInt(9, 12);
-				ribs = Array.from({ length: ribCount }, (_, i) => ({
-					angle: (i / ribCount) * TAU + random(-0.12, 0.12),
-					depth: random(0.035, 0.075),
-					width: random(0.1, 0.17),
+			// Ribs: uneven spacing, each lobe bulging between two creases. The
+			// creases wander as they run down, and differ in depth.
+			const grooveCount = randInt(10, 13);
+			const spacing = Array.from({ length: grooveCount }, () => random(0.7, 1.3));
+			const spacingTotal = spacing.reduce((a, b) => a + b, 0);
+			let grooveAngle = random(0, TAU);
+			const grooves = spacing.map((step) => {
+				const groove = {
+					angle: grooveAngle,
+					depth: random(0.05, 0.095),
 					wander: random(-0.1, 0.1),
 					phase: random(0, TAU),
-				}));
+					swell: random(-0.02, 0.03), // how much the lobe after it bulges
+				};
+				grooveAngle += (step / spacingTotal) * TAU;
+				return groove;
+			});
 
-				// Slow lumps so no two sides match.
-				lumps = Array.from({ length: 4 }, () => ({
-					m: randInt(1, 3),
-					n: randInt(1, 3),
-					amp: random(0.008, 0.022),
-					phase: random(0, TAU),
-				}));
+			const lumps = Array.from({ length: 4 }, () => ({
+				m: randInt(1, 3),
+				n: randInt(1, 3),
+				amp: random(0.008, 0.02),
+				phase: random(0, TAU),
+			}));
 
-				topDimple = random(0.13, 0.2);
-				bottomDimple = random(0.05, 0.1);
-
-				lidV = random(0.17, 0.2);
-				lidTeeth = randInt(5, 8);
-				lidJag = Array.from({ length: lidTeeth }, () => random(0.5, 1.4));
-				lidTilt = random(0, TAU);
-				// Columns land exactly on every zig-zag tip.
-				COLS = lidTeeth * 2 * Math.round(100 / lidTeeth);
-
-				faceV = random(0.44, 0.48);
-				turn = random(-0.15, 0.15);
-				noise = makeNoise();
-				skinDirty = true;
+			// Warts: a couple of clusters plus a few strays.
+			const warts = [];
+			for (let c = 0, clusters = randInt(1, 3); c < clusters; c++) {
+				const theta = random(-Math.PI, Math.PI);
+				const phi = random(0.3, 0.8) * Math.PI;
+				for (let i = 0, n = randInt(4, 10); i < n; i++) {
+					warts.push({ theta: theta + random(-0.18, 0.18), phi: phi + random(-0.15, 0.15), size: random(0.018, 0.04), height: random(0.006, 0.016) });
+				}
+			}
+			for (let i = 0, n = randInt(3, 7); i < n; i++) {
+				warts.push({ theta: random(-Math.PI, Math.PI), phi: random(0.25, 0.85) * Math.PI, size: random(0.015, 0.03), height: random(0.005, 0.012) });
 			}
 
-			const wrapAngle = (a) => a - TAU * Math.round(a / TAU);
+			const topDimple = random(0.2, 0.28);
+			const bottomDimple = random(0.05, 0.1);
 
-			// Roughly 0 on a lobe, up to the rib's depth in a groove.
-			function grooveAt(theta, phi) {
-				let groove = 0;
-				for (const rib of ribs) {
-					const center = rib.angle + rib.wander * Math.sin(phi * 2 + rib.phase);
-					const distance = wrapAngle(theta - center) / rib.width;
-					groove += rib.depth * Math.exp(-0.5 * distance * distance);
+			const lidV = random(0.17, 0.2);
+			const lidTeeth = randInt(5, 8);
+			const lidJag = Array.from({ length: lidTeeth }, () => random(0.5, 1.4));
+			const lidTilt = random(0, TAU);
+			// Columns land exactly on every zig-zag tip.
+			const COLS = lidTeeth * 2 * Math.round(180 / lidTeeth);
+
+			const faceV = random(0.44, 0.48);
+			const turn = random(-0.12, 0.12);
+			const noise = makeNoise();
+
+			// Groove positions at one height, as offsets from the first groove.
+			const _offsets = new Float64Array(32);
+			let _first = 0;
+			function setGrooveRow(phi) {
+				_first = grooves[0].angle + grooves[0].wander * Math.sin(phi * 2 + grooves[0].phase);
+				for (let i = 1; i < grooveCount; i++) {
+					const g = grooves[i];
+					_offsets[i] = (((g.angle + g.wander * Math.sin(phi * 2 + g.phase) - _first) % TAU) + TAU) % TAU;
 				}
-				return groove * settings.grooves;
+				_offsets[0] = 0;
+				_offsets[grooveCount] = TAU;
+			}
+
+			// Which lobe theta is on (after setGrooveRow), and how far across it
+			// it sits in _lobeT (0 and 1 are the creases).
+			let _lobeT = 0;
+
+			// 1 on the middle of a lobe, 0 in a crease. The crease is a V with a
+			// slightly rounded bottom, so the mesh can follow it without stepping.
+			function lobeBulge(t) {
+				const s = Math.sin(Math.PI * t);
+				return Math.pow((Math.sqrt(s * s + 0.0225) - 0.15) / 0.8601, 0.6);
+			}
+
+			function lobeAt(theta) {
+				const x = (((theta - _first) % TAU) + TAU) % TAU;
+				let k = 0;
+				while (k < grooveCount - 1 && x >= _offsets[k + 1]) k++;
+				_lobeT = (x - _offsets[k]) / (_offsets[k + 1] - _offsets[k]);
+				return k;
 			}
 
 			function surfacePoint(u, v, target = new THREE.Vector3()) {
@@ -231,23 +262,35 @@
 				const phi = Math.PI * v;
 				const s = Math.max(0, Math.sin(phi)); // v can overshoot 1 by a hair
 
-				// Grooves and lumps fade out at the poles so the surface closes cleanly.
-				let r = 1 - grooveAt(theta, phi) * Math.pow(s, 0.6);
+				// Lobes and creases; they fade toward the poles so the surface closes.
+				setGrooveRow(phi);
+				const k = lobeAt(theta);
+				const bulge = lobeBulge(_lobeT);
+				const depth = _lobeT < 0.5 ? grooves[k].depth : grooves[(k + 1) % grooveCount].depth;
+				const fade = Math.pow(s, 0.35);
+				let r = 1 - depth * (1 - bulge) * fade + grooves[k].swell * bulge * fade;
+
 				for (const lump of lumps) {
 					r += lump.amp * s * Math.sin(lump.m * theta + lump.phase) * Math.sin(lump.n * phi + lump.phase);
 				}
+				for (const wart of warts) {
+					const dPhi = phi - wart.phi;
+					if (Math.abs(dPhi) > wart.size * 3) continue;
+					const dTheta = wrapAngle(theta - wart.theta) * s;
+					const d2 = (dPhi * dPhi + dTheta * dTheta) / (wart.size * wart.size);
+					if (d2 < 9) r += wart.height * Math.exp(-d2);
+				}
 
-				// Sunken stem and blossom ends.
-				r -= topDimple * Math.exp(-((phi / 0.3) ** 2));
+				// Sunken stem cavity and blossom end.
+				r -= topDimple * Math.exp(-((phi / 0.32) ** 2));
 				r -= bottomDimple * Math.exp(-(((Math.PI - phi) / 0.35) ** 2));
 
 				// Squash the bottom so it sits flat on the table.
-				const { width: W, height: H } = settings;
 				let y = Math.cos(phi) * r * H;
 				const floor = -0.8 * H;
 				if (y < floor) y = floor - (floor - y) / (1 + (floor - y) / 0.05);
 
-				return target.set(Math.sin(theta) * s * r * W, y, Math.cos(theta) * s * r * W);
+				return target.set(Math.sin(theta) * s * r * W + lean.x * y, y, Math.cos(theta) * s * r * D + lean.z * y);
 			}
 
 			const _p1 = new THREE.Vector3();
@@ -261,10 +304,7 @@
 
 				const e = 1e-4;
 				_du.subVectors(surfacePoint(u + e, v, _p1), surfacePoint(u - e, v, _p2));
-				_dv.subVectors(
-					surfacePoint(u, Math.min(1, v + e), _p1),
-					surfacePoint(u, Math.max(0, v - e), _p2),
-				);
+				_dv.subVectors(surfacePoint(u, Math.min(1, v + e), _p1), surfacePoint(u, Math.max(0, v - e), _p2));
 				return target.crossVectors(_dv, _du).normalize();
 			}
 
@@ -283,7 +323,7 @@
 			// Keep everything between y = -0.36 and 0.4 so it stays below the lid.
 			// =====================================================================
 
-			const toUV = ([x, y]) => [0.5 + x / (TAU * settings.width), faceV + y / (Math.PI * settings.height)];
+			const toUV = ([x, y]) => [0.5 + x / (TAU * W), faceV + y / (Math.PI * H)];
 
 			function triangle(cx, cy, width, height, tilt) {
 				const c = Math.cos(tilt);
@@ -318,7 +358,7 @@
 					list.reduce((sum, t) => {
 						const d = Math.abs(x - t.x);
 						const shape = t.sharp ? 1 - d / (t.w / 2) : (t.w / 2 + 0.012 - d) / 0.012;
-						return sum + t.h * thick(t.x) * Math.min(1, Math.max(0, shape));
+						return sum + t.h * thick(t.x) * clamp(shape, 0, 1);
 					}, 0);
 
 				const top = [];
@@ -341,13 +381,7 @@
 					const gap = random(0.26, 0.32);
 					const size = random(0.2, 0.25);
 					const eye = (side) =>
-						triangle(
-							side * gap + random(-0.03, 0.03),
-							eyeY + random(-0.03, 0.03),
-							size * random(0.85, 1.15),
-							size * random(0.8, 1.1),
-							random(-0.2, 0.2),
-						);
+						triangle(side * gap + random(-0.03, 0.03), eyeY + random(-0.03, 0.03), size * random(0.85, 1.15), size * random(0.8, 1.1), random(-0.2, 0.2));
 					const mouthHalf = random(0.36, 0.46);
 					const tooth = (x) => ({ x: x * mouthHalf, w: random(0.07, 0.1), h: random(0.45, 0.6) });
 
@@ -355,15 +389,10 @@
 						eye(-1),
 						eye(1),
 						triangle(random(-0.03, 0.03), random(-0.02, 0.02), random(0.09, 0.12), random(0.08, 0.11), random(-0.15, 0.15)),
-						grin(
-							random(0.17, 0.21),
-							mouthHalf,
-							random(0.05, 0.09),
-							random(0.14, 0.18),
-							random(-0.08, 0.08),
-							[tooth(random(-0.25, 0.15))],
-							[tooth(random(-0.6, -0.4)), tooth(random(0.35, 0.55))],
-						),
+						grin(random(0.17, 0.21), mouthHalf, random(0.05, 0.09), random(0.14, 0.18), random(-0.08, 0.08), [tooth(random(-0.25, 0.15))], [
+							tooth(random(-0.6, -0.4)),
+							tooth(random(0.35, 0.55)),
+						]),
 					];
 				},
 
@@ -371,8 +400,7 @@
 				goofy() {
 					const big = random(0.11, 0.14);
 					const small = big * random(0.55, 0.7);
-					const side = rand() < 0.5 ? -1 : 1; // which eye is the big one
-
+					const side = rand() < 0.5 ? -1 : 1;
 					return [
 						blob(side * random(0.28, 0.32), random(-0.22, -0.18), big, big * random(0.9, 1.15), random(-0.3, 0.3)),
 						blob(-side * random(0.25, 0.3), random(-0.26, -0.21), small, small * random(0.8, 1.1), random(-0.3, 0.3)),
@@ -396,7 +424,7 @@
 					const w = random(0.22, 0.27);
 					const h = random(0.15, 0.19);
 					const eye = (side) => {
-						const slant = random(0.07, 0.11); // brows angle down toward the nose
+						const slant = random(0.07, 0.11);
 						const cx = side * (gap + random(-0.02, 0.02));
 						const cy = eyeY + random(-0.02, 0.02);
 						// Local x points toward the nose.
@@ -406,32 +434,17 @@
 							[w * 0.15, h / 2],
 						].map(([x, y]) => [cx - side * x, cy + y]);
 					};
-
 					const mouthHalf = random(0.4, 0.48);
 					const n = randInt(4, 5);
 					const toothW = (1.5 * mouthHalf) / n;
 					const start = -0.75 * mouthHalf;
 					const fangs = (count, offset, min, max) =>
-						Array.from({ length: count }, (_, i) => ({
-							x: start + toothW * (i + offset),
-							w: toothW,
-							h: random(min, max),
-							sharp: true,
-						}));
-
+						Array.from({ length: count }, (_, i) => ({ x: start + toothW * (i + offset), w: toothW, h: random(min, max), sharp: true }));
 					return [
 						eye(-1),
 						eye(1),
 						triangle(random(-0.02, 0.02), random(-0.02, 0.02), random(0.06, 0.08), random(0.12, 0.15), random(-0.1, 0.1)),
-						grin(
-							random(0.2, 0.24),
-							mouthHalf,
-							random(-0.04, 0.02),
-							random(0.17, 0.21),
-							random(-0.05, 0.05),
-							fangs(n, 0.5, 0.6, 0.75),
-							fangs(n - 1, 1, 0.55, 0.7),
-						),
+						grin(random(0.2, 0.24), mouthHalf, random(-0.04, 0.02), random(0.17, 0.21), random(-0.05, 0.05), fangs(n, 0.5, 0.6, 0.75), fangs(n - 1, 1, 0.55, 0.7)),
 					];
 				},
 
@@ -442,10 +455,10 @@
 					const eye = (side) =>
 						blob(side * gap + random(-0.02, 0.02), eyeY + random(-0.02, 0.02), random(0.08, 0.1), random(0.1, 0.12), random(-0.2, 0.2));
 					const brow = (side) =>
-						grin(eyeY - 0.17 + random(-0.015, 0.01), random(0.08, 0.1), random(-0.04, -0.025), 0.035, side * random(0, 0.15)).map(
-							([x, y]) => [x + side * gap, y],
-						);
-
+						grin(eyeY - 0.17 + random(-0.015, 0.01), random(0.08, 0.1), random(-0.04, -0.025), 0.035, side * random(0, 0.15)).map(([x, y]) => [
+							x + side * gap,
+							y,
+						]);
 					return [
 						eye(-1),
 						eye(1),
@@ -462,9 +475,7 @@
 				poly.forEach((a, i) => {
 					const b = poly[(i + 1) % poly.length];
 					const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / step));
-					for (let k = 0; k < n; k++) {
-						out.push([a[0] + ((b[0] - a[0]) * k) / n, a[1] + ((b[1] - a[1]) * k) / n]);
-					}
+					for (let k = 0; k < n; k++) out.push([a[0] + ((b[0] - a[0]) * k) / n, a[1] + ((b[1] - a[1]) * k) / n]);
 				});
 				return out;
 			}
@@ -497,26 +508,24 @@
 				return area > 0 ? poly : poly.reverse();
 			}
 
+			rand = mulberry32(settings.seed + 1);
+			const holes = FACES[settings.face]().map((shape) => orient(wobble(densify(shape, 0.012), 0.004).map(toUV)));
+
 			// The carving mask: white = pumpkin, black = hole. It cuts the shells
 			// (via alphaMap) and tells buildShell which grid cells to drop.
 			const MASK_W = 2048;
 			const MASK_H = 1024;
 			const [maskCanvas, maskCtx] = makeCanvas(MASK_W, MASK_H);
-			const maskTexture = new THREE.CanvasTexture(maskCanvas);
-			let maskPixels;
-
-			function drawMask(holes) {
-				maskCtx.fillStyle = "#fff";
-				maskCtx.fillRect(0, 0, MASK_W, MASK_H);
-				maskCtx.fillStyle = "#000";
-				for (const hole of holes) {
-					maskCtx.beginPath();
-					for (const [u, v] of hole) maskCtx.lineTo(u * MASK_W, v * MASK_H);
-					maskCtx.fill();
-				}
-				maskPixels = maskCtx.getImageData(0, 0, MASK_W, MASK_H).data;
-				maskTexture.needsUpdate = true;
+			maskCtx.fillStyle = "#fff";
+			maskCtx.fillRect(0, 0, MASK_W, MASK_H);
+			maskCtx.fillStyle = "#000";
+			for (const hole of holes) {
+				maskCtx.beginPath();
+				for (const [u, v] of hole) maskCtx.lineTo(u * MASK_W, v * MASK_H);
+				maskCtx.fill();
 			}
+			const maskPixels = maskCtx.getImageData(0, 0, MASK_W, MASK_H).data;
+			const maskTexture = new THREE.CanvasTexture(maskCanvas);
 
 			function isHole(u, v) {
 				const x = Math.min(MASK_W - 1, Math.floor(u * MASK_W));
@@ -597,32 +606,47 @@
 				return [geometry(outer, outerNormals, outerIndex), geometry(inner, innerNormals, innerIndex)];
 			}
 
-			// The cut walls: for each closed loop of (u, v) points, a strip joining
-			// the outer skin to the inner skin. Faces point to the +v side of +u.
+			// The cut walls: for each closed loop of (u, v) points, a strip from the
+			// outer skin to the inner skin. Faces point to the +v side of +u.
+			// uv.x runs along the cut, uv.y across it (0 = skin, 1 = inside).
+			const RIM_ROWS = [0, 0.05, 0.12, 0.55, 1];
 			function buildRim(loops) {
 				const positions = [];
+				const uvs = [];
 				const index = [];
 				const p = new THREE.Vector3();
 				const n = new THREE.Vector3();
+				const q = new THREE.Vector3();
+				const prev = new THREE.Vector3();
+				const rows = RIM_ROWS.length;
 
 				for (const loop of loops) {
 					const start = positions.length / 3;
-					for (const [u, v] of loop) {
+					let s = 0;
+					for (let k = 0; k <= loop.length; k++) {
+						const [u, v] = loop[k % loop.length];
 						surfacePoint(u, v, p);
 						surfaceNormal(u, v, n);
-						positions.push(p.x, p.y, p.z);
-						p.addScaledVector(n, -SHELL);
-						positions.push(p.x, p.y, p.z);
+						if (k > 0) s += p.distanceTo(prev);
+						prev.copy(p);
+						for (const f of RIM_ROWS) {
+							q.copy(p).addScaledVector(n, -SHELL * f);
+							positions.push(q.x, q.y, q.z);
+							uvs.push(s / 0.4, f);
+						}
 					}
 					for (let k = 0; k < loop.length; k++) {
-						const o0 = start + 2 * k;
-						const o1 = start + 2 * ((k + 1) % loop.length);
-						index.push(o0, o0 + 1, o1, o1, o0 + 1, o1 + 1);
+						for (let r = 0; r < rows - 1; r++) {
+							const a = start + k * rows + r;
+							const b = a + rows;
+							index.push(a, a + 1, b, b, a + 1, b + 1);
+						}
 					}
 				}
 
 				const geometry = new THREE.BufferGeometry();
 				geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+				geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
 				geometry.setIndex(index);
 				geometry.computeVertexNormals();
 				return geometry;
@@ -632,126 +656,385 @@
 			// Pumpkin textures
 			// =====================================================================
 
-			const SKIN_W = 1024;
-			const SKIN_H = 512;
-			const [skinCanvas, skinCtx] = makeCanvas(SKIN_W, SKIN_H);
-			const skinTexture = colorTexture(skinCanvas);
-			let skinDirty = true; // repaint when the seed or groove depth changes
+			// Skin: color, bump and roughness in one pass. Per-lobe tint, darker
+			// creases that turn greenish near the stem, fine lengthwise striations
+			// and pale veins, a pale "ground spot" where it lay in the field, then
+			// warts, scabs, healed scratches, pores and dirt painted on top.
+			function skinTextures() {
+				rand = mulberry32(settings.seed + 3);
+				const w = 2048;
+				const h = 1024;
+				const lobeTint = grooves.map(() => random(-1, 1));
+				const spot = { u: random(0, 1), v: random(0.74, 0.86), ru: random(0.06, 0.1), rv: random(0.08, 0.12) };
+				let rowV = -1;
 
-			function paintSkin() {
-				paintPixels(skinCtx, SKIN_W, SKIN_H, (x, y) => {
-					const u = (x + 0.5) / SKIN_W;
-					const v = (y + 0.5) / SKIN_H;
-					const groove = Math.min(1, grooveAt(TAU * (u - 0.5), Math.PI * v) / 0.05);
-					const streak = noise(u * 220, v * 6, 220);
-					const blotch = noise(u * 10, v * 5, 10);
-					const pole = Math.max(Math.exp(-((v / 0.07) ** 2)), Math.exp(-(((1 - v) / 0.09) ** 2)));
+				const [[colorCanvas, colorCtx], [bumpCanvas, bumpCtx], [roughCanvas, roughCtx]] = paintCanvases(w, h, 3, (x, y, out) => {
+					const u = (x + 0.5) / w;
+					const v = (y + 0.5) / h;
+					if (v !== rowV) {
+						setGrooveRow(Math.PI * v);
+						rowV = v;
+					}
+					const k = lobeAt(TAU * (u - 0.5));
+					const crease = 1 - lobeBulge(_lobeT);
+					const c2 = crease * crease;
+					const streak = noise(u * 700, v * 5, 700);
+					const vein = Math.max(0, noise(u * 1300, v * 2.5 + 40, 1300) - 0.7) * 3.3;
+					const blotch = noise(u * 8, v * 5 + 20, 8);
+					const tone = 0.5 + 0.3 * lobeTint[k] + 0.35 * (blotch - 0.5);
 
-					const r = 255 - 50 * groove - 22 * streak + 10 * blotch;
-					const g = 140 - 50 * groove - 22 * streak + 30 * (blotch - 0.5);
-					const b = 22 - 12 * groove;
-					// Olive-brown where the stem and blossom attach.
-					return [r + (120 - r) * pole, g + (92 - g) * pole, b + (40 - b) * pole];
+					const shade = 0.97 + 0.04 * streak;
+					let r = (222 + 33 * tone) * shade;
+					let g = (98 + 52 * tone) * shade;
+					let b = (12 + 16 * tone) * shade;
+					r += (252 - r) * vein * 0.1;
+					g += (176 - g) * vein * 0.1;
+					b += (70 - b) * vein * 0.1;
+
+					const green = c2 * Math.max(0, 1 - v / 0.3);
+					r += (120 - r) * c2 * 0.55 + (95 - r) * green * 0.5;
+					g += (52 - g) * c2 * 0.5 + (85 - g) * green * 0.5;
+					b += (12 - b) * c2 * 0.5 + (30 - b) * green * 0.5;
+
+					const du = (u - spot.u - Math.round(u - spot.u)) / spot.ru;
+					const dv = (v - spot.v) / spot.rv;
+					const ground = smoothstep(1, 0.55, Math.hypot(du, dv) + 0.3 * (noise(u * 40, v * 40, 40) - 0.5));
+					r += (226 - r) * ground * 0.75;
+					g += (178 - g) * ground * 0.75;
+					b += (92 - b) * ground * 0.75;
+
+					const pole = Math.max(Math.exp(-((v / 0.06) ** 2)), Math.exp(-(((1 - v) / 0.08) ** 2)));
+					r += (112 - r) * pole;
+					g += (90 - g) * pole;
+					b += (44 - b) * pole;
+
+					out[0][0] = r;
+					out[0][1] = g;
+					out[0][2] = b;
+					const bump = 255 * (0.5 + 0.1 * (streak - 0.5) + 0.12 * vein);
+					out[1][0] = out[1][1] = out[1][2] = bump;
+					const rough = 255 * (0.5 + 0.12 * crease + 0.3 * ground + 0.06 * streak + 0.3 * pole);
+					out[2][0] = out[2][1] = out[2][2] = rough;
 				});
 
-				// Specks and scuffs.
-				for (let i = 0; i < 400; i++) {
-					skinCtx.fillStyle = `rgba(${randInt(90, 140)}, 55, 10, ${random(0.15, 0.4)})`;
-					skinCtx.fillRect(random(0, SKIN_W), random(0, SKIN_H), random(1, 3), random(1, 2.5));
+				const all = [colorCtx, bumpCtx, roughCtx];
+				const wrapX = (draw) => {
+					// Draw near the seam twice so marks wrap around the back.
+					for (const dx of [-w, 0, w]) draw(dx);
+				};
+
+				// Pores: tiny pale dots.
+				for (let i = 0; i < 6000; i++) {
+					const x = random(0, w);
+					const y = random(0, h);
+					const size = random(0.8, 1.8);
+					colorCtx.fillStyle = `rgba(255, 205, 130, ${random(0.15, 0.4)})`;
+					colorCtx.fillRect(x, y, size, size);
+					bumpCtx.fillStyle = "rgba(255, 255, 255, 0.4)";
+					bumpCtx.fillRect(x, y, size, size);
 				}
 
-				// The knife line around the lid.
-				skinCtx.strokeStyle = "rgba(60, 22, 4, 0.8)";
-				skinCtx.lineWidth = 2.5;
-				skinCtx.beginPath();
-				for (let i = 0; i <= COLS; i++) skinCtx.lineTo((i / COLS) * SKIN_W, lidCut(i / COLS) * SKIN_H);
-				skinCtx.stroke();
+				// Warts: corky, pale-topped bumps where the geometry has them.
+				for (const wart of warts) {
+					const x = ((wart.theta / TAU + 0.5) % 1) * w;
+					const y = (wart.phi / Math.PI) * h;
+					const ry = (wart.size / Math.PI) * h * 1.6;
+					const rx = (wart.size / (TAU * Math.max(0.2, Math.sin(wart.phi)))) * w * 1.6;
+					wrapX((dx) => {
+						for (const [ctx, inner, outer] of [
+							[colorCtx, "rgba(214, 168, 104, 0.9)", "rgba(170, 80, 20, 0)"],
+							[bumpCtx, "rgba(255, 255, 255, 0.9)", "rgba(255, 255, 255, 0)"],
+							[roughCtx, "rgba(220, 220, 220, 0.9)", "rgba(220, 220, 220, 0)"],
+						]) {
+							const gradient = ctx.createRadialGradient(x + dx, y, 0, x + dx, y, Math.max(rx, ry));
+							gradient.addColorStop(0, inner);
+							gradient.addColorStop(1, outer);
+							ctx.fillStyle = gradient;
+							ctx.beginPath();
+							ctx.ellipse(x + dx, y, rx, ry, 0, 0, TAU);
+							ctx.fill();
+						}
+					});
+				}
 
-				skinTexture.needsUpdate = true;
-				skinDirty = false;
+				// Scabs: irregular brown corky patches with lighter rims.
+				for (let i = 0, n = randInt(3, 6); i < n; i++) {
+					const cx = random(0, w);
+					const cy = random(0.25, 0.9) * h;
+					const radius = random(6, 22);
+					const points = Array.from({ length: 14 }, (_, k) => {
+						const a = (k / 14) * TAU;
+						const r = radius * random(0.6, 1.3);
+						return [cx + Math.cos(a) * r * 1.4, cy + Math.sin(a) * r];
+					});
+					for (const [ctx, fill, stroke] of [
+						[colorCtx, "rgba(98, 58, 28, 0.85)", "rgba(178, 128, 74, 0.6)"],
+						[bumpCtx, "rgba(150, 150, 150, 0.9)", "rgba(255, 255, 255, 0.7)"],
+						[roughCtx, "rgba(235, 235, 235, 1)", "rgba(220, 220, 220, 1)"],
+					]) {
+						ctx.beginPath();
+						points.forEach(([px, py]) => ctx.lineTo(px, py));
+						ctx.closePath();
+						ctx.fillStyle = fill;
+						ctx.fill();
+						ctx.lineWidth = 2;
+						ctx.strokeStyle = stroke;
+						ctx.stroke();
+					}
+				}
+
+				// Healed scratches: thin, raised, tan lines.
+				for (let i = 0, n = randInt(4, 9); i < n; i++) {
+					let x = random(0, w);
+					let y = random(0.2, 0.9) * h;
+					let a = random(0, TAU);
+					const steps = randInt(8, 30);
+					for (const ctx of all) ctx.beginPath();
+					for (const ctx of all) ctx.moveTo(x, y);
+					for (let s = 0; s < steps; s++) {
+						a += random(-0.3, 0.3);
+						x += Math.cos(a) * 5;
+						y += Math.sin(a) * 5;
+						for (const ctx of all) ctx.lineTo(x, y);
+					}
+					colorCtx.strokeStyle = "rgba(208, 166, 104, 0.75)";
+					bumpCtx.strokeStyle = "rgba(255, 255, 255, 0.8)";
+					roughCtx.strokeStyle = "rgba(230, 230, 230, 1)";
+					for (const ctx of all) {
+						ctx.lineWidth = random(1.2, 2.6);
+						ctx.stroke();
+					}
+				}
+
+				// Dirt smudges toward the bottom.
+				colorCtx.filter = "blur(6px)";
+				for (let i = 0; i < 26; i++) {
+					colorCtx.fillStyle = `rgba(52, 36, 22, ${random(0.08, 0.22)})`;
+					colorCtx.beginPath();
+					colorCtx.ellipse(random(0, w), random(0.84, 1) * h, random(10, 40), random(5, 18), random(0, TAU), 0, TAU);
+					colorCtx.fill();
+				}
+				colorCtx.filter = "none";
+
+				// The knife line around the lid.
+				for (const [ctx, style] of [
+					[colorCtx, "rgba(60, 22, 4, 0.85)"],
+					[bumpCtx, "rgba(0, 0, 0, 0.9)"],
+				]) {
+					ctx.strokeStyle = style;
+					ctx.lineWidth = 3;
+					ctx.beginPath();
+					for (let i = 0; i <= COLS; i++) ctx.lineTo((i / COLS) * w, lidCut(i / COLS) * h);
+					ctx.stroke();
+				}
+
+				return [colorTexture(colorCanvas), dataTexture(bumpCanvas), dataTexture(roughCanvas)];
 			}
 
-			function fleshTexture() {
-				const width = 512;
-				const height = 256;
-				const [canvas, ctx] = makeCanvas(width, height);
-				const fleshNoise = makeNoise();
-
-				paintPixels(ctx, width, height, (x, y) => {
-					const u = x / width;
-					const v = y / height;
-					const fiber = fleshNoise(u * 120, v * 10, 120);
-					const blotch = fleshNoise(u * 8, v * 4 + 80, 8);
-					return [240 - 25 * fiber, 165 + 30 * blotch - 25 * fiber, 50 + 20 * blotch];
+			// Inside wall: pale, fibrous flesh with spoon scrapes and stringy pulp
+			// left near the bottom.
+			function fleshTextures() {
+				const w = 1024;
+				const h = 512;
+				const [[colorCanvas, colorCtx], [bumpCanvas, bumpCtx]] = paintCanvases(w, h, 2, (x, y, out) => {
+					const u = x / w;
+					const v = y / h;
+					const fiber = noise(u * 160, v * 14 + 30, 160);
+					const blotch = noise(u * 9, v * 5 + 60, 9);
+					const deep = smoothstep(0.75, 1, v);
+					out[0][0] = 242 - 18 * fiber - 10 * deep;
+					out[0][1] = 182 + 25 * blotch - 30 * fiber - 40 * deep;
+					out[0][2] = 78 + 20 * blotch - 25 * deep;
+					out[1][0] = out[1][1] = out[1][2] = 255 * (0.5 + 0.2 * fiber);
 				});
 
-				return colorTexture(canvas);
+				for (let i = 0; i < 110; i++) {
+					const x = random(0, w);
+					const y = random(0.15, 0.95) * h;
+					const rx = random(20, 70);
+					const start = random(0, TAU);
+					for (const [ctx, style] of [
+						[colorCtx, "rgba(255, 228, 165, 0.2)"],
+						[bumpCtx, "rgba(0, 0, 0, 0.3)"],
+					]) {
+						ctx.strokeStyle = style;
+						ctx.lineWidth = random(2, 6);
+						ctx.beginPath();
+						ctx.ellipse(x, y, rx, rx * random(0.4, 0.8), random(0, TAU), start, start + random(0.6, 1.6));
+						ctx.stroke();
+					}
+				}
+
+				for (let i = 0; i < 60; i++) {
+					let x = random(0, w);
+					let y = random(0.7, 1) * h;
+					colorCtx.strokeStyle = `rgba(214, 120, 30, ${random(0.35, 0.7)})`;
+					colorCtx.lineWidth = random(1.2, 3);
+					colorCtx.beginPath();
+					colorCtx.moveTo(x, y);
+					for (let s = 0; s < 8; s++) {
+						x += random(-12, 12);
+						y += random(-6, 6);
+						colorCtx.lineTo(x, y);
+					}
+					colorCtx.stroke();
+				}
+
+				return [colorTexture(colorCanvas), dataTexture(bumpCanvas)];
+			}
+
+			// Cut faces: a thin band of orange skin, then pale flesh with knife
+			// streaks. The glow map makes the flesh light up from within, the way
+			// thin cut edges do on a real lantern.
+			function rimTextures() {
+				const w = 512;
+				const h = 64;
+				const [[colorCanvas], [glowCanvas]] = paintCanvases(w, h, 2, (x, y, out) => {
+					const t = y / (h - 1);
+					const fiber = 0.5 + 0.4 * (noise(x * 0.35, t * 3 + 200) - 0.5);
+					const skin = t < 0.05 ? 1 : 1 - smoothstep(0.05, 0.1, t);
+					const flesh = [246 - 10 * fiber, 150 - 30 * t - 20 * fiber, 42 - 20 * t - 10 * fiber];
+					const skinColor = [176, 72, 14];
+					for (let c = 0; c < 3; c++) out[0][c] = flesh[c] + (skinColor[c] - flesh[c]) * skin;
+					const glow = 255 * (1 - skin) * (0.2 + 0.8 * t) * (0.85 + 0.15 * fiber);
+					out[1][0] = glow;
+					out[1][1] = glow * 0.75;
+					out[1][2] = glow * 0.4;
+				});
+				const color = colorTexture(colorCanvas);
+				const glow = colorTexture(glowCanvas);
+				color.wrapS = glow.wrapS = THREE.RepeatWrapping;
+				return [color, glow];
+			}
+
+			// =====================================================================
+			// Cutaway
+			// Wherever the pumpkin is within reach of the camera, its surface
+			// dissolves and a wireframe of the same mesh fades in, so moving through
+			// the shell shows the inside instead of a wall.
+			// =====================================================================
+
+			const cutaway = {
+				center: { value: new THREE.Vector3(0, -999, 0) },
+				radius: { value: 0.32 },
+			};
+
+			function addCutaway(material, wire = false) {
+				material.onBeforeCompile = (shader) => {
+					shader.uniforms.uCutCenter = cutaway.center;
+					shader.uniforms.uCutRadius = cutaway.radius;
+					shader.vertexShader = shader.vertexShader
+						.replace("#include <common>", "#include <common>\nvarying vec3 vCutWorld;")
+						.replace("#include <project_vertex>", "#include <project_vertex>\nvCutWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;");
+					shader.fragmentShader = shader.fragmentShader
+						.replace("#include <common>", "#include <common>\nuniform vec3 uCutCenter;\nuniform float uCutRadius;\nvarying vec3 vCutWorld;")
+						.replace(
+							"void main() {",
+							`void main() {
+								float cutFade = smoothstep(uCutRadius * 0.5, uCutRadius, distance(vCutWorld, uCutCenter));
+								${
+									wire
+										? "if (cutFade > 0.99) discard;"
+										: "if (cutFade < fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))))) discard;"
+								}`,
+						);
+					if (wire) {
+						shader.fragmentShader = shader.fragmentShader.replace(
+							"#include <dithering_fragment>",
+							"#include <dithering_fragment>\ngl_FragColor.a *= 1.0 - cutFade;",
+						);
+					}
+				};
+				material.customProgramCacheKey = () => (wire ? "cutaway-wire" : "cutaway-solid");
+				return material;
 			}
 
 			// =====================================================================
 			// Materials
 			// =====================================================================
 
-			const skinMaterial = new THREE.MeshStandardMaterial({
-				map: skinTexture,
-				alphaMap: maskTexture,
-				alphaTest: 0.5,
-				roughness: 0.55,
-			});
-			const fleshMaterial = new THREE.MeshStandardMaterial({
-				map: fleshTexture(),
-				alphaMap: maskTexture,
-				alphaTest: 0.5,
-				roughness: 0.9,
-			});
-			const cutMaterial = new THREE.MeshStandardMaterial({ color: "#f2b860", roughness: 0.8 });
-			const stemMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85 });
-			const tendrilMaterial = new THREE.MeshStandardMaterial({ color: "#6f7a32", roughness: 0.7 });
-			// The faint emissive fakes light glowing through the wax.
-			const waxMaterial = new THREE.MeshStandardMaterial({
-				color: "#efe0bf",
-				roughness: 0.5,
-				emissive: "#ff8a3a",
-				emissiveIntensity: 0.2,
-			});
-			const wickMaterial = new THREE.MeshStandardMaterial({ color: "#1b130d", roughness: 1 });
-			const emberMaterial = new THREE.MeshStandardMaterial({ color: "#000", emissive: "#ff6a20", emissiveIntensity: 3 });
+			const [skinMap, skinBump, skinRough] = skinTextures();
+			const [fleshMap, fleshBump] = fleshTextures();
+			const [rimMap, rimGlow] = rimTextures();
 
-			// The ones the wireframe toggle switches.
-			const pumpkinMaterials = [skinMaterial, fleshMaterial, cutMaterial, stemMaterial, tendrilMaterial, waxMaterial];
+			// A light clearcoat gives the waxy sheen of pumpkin skin.
+			const skinMaterial = addCutaway(
+				new THREE.MeshPhysicalMaterial({
+					map: skinMap,
+					bumpMap: skinBump,
+					bumpScale: 1.2,
+					roughnessMap: skinRough,
+					roughness: 1,
+					clearcoat: 0.12,
+					clearcoatRoughness: 0.6,
+					alphaMap: maskTexture,
+					alphaTest: 0.5,
+				}),
+			);
+			const fleshMaterial = addCutaway(
+				new THREE.MeshStandardMaterial({
+					map: fleshMap,
+					bumpMap: fleshBump,
+					bumpScale: 2,
+					roughness: 0.6,
+					alphaMap: maskTexture,
+					alphaTest: 0.5,
+				}),
+			);
+			const cutMaterial = addCutaway(
+				new THREE.MeshStandardMaterial({
+					map: rimMap,
+					emissiveMap: rimGlow,
+					emissive: "#ffffff",
+					emissiveIntensity: 0.45,
+					roughness: 0.45, // freshly cut flesh is moist
+				}),
+			);
+			const stemMaterial = addCutaway(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9 }));
+			const tendrilMaterial = new THREE.MeshStandardMaterial({ color: "#5f5a2c", roughness: 0.8 });
+			const wireMaterial = addCutaway(
+				new THREE.MeshBasicMaterial({ color: "#ffb46a", wireframe: true, transparent: true, opacity: 0.45, depthWrite: false }),
+				true,
+			);
 
 			// =====================================================================
 			// Stem and tendrils
 			// =====================================================================
 
+			// A thick, corky stem with uneven angular ridges that spread into
+			// "fingers" where it grows out of the pumpkin, and a dry cut end.
 			function buildStem() {
+				rand = mulberry32(settings.seed + 4);
 				const base = surfacePoint(0, 0);
-				const height = random(0.3, 0.42);
-				const radius = random(0.06, 0.08);
-				const lean = random(0.1, 0.45);
-				const bend = random(-0.2, 0.2);
+				const height = random(0.32, 0.46);
+				const radius = random(0.085, 0.11);
+				const lean = random(0.08, 0.3);
+				const bend = random(-0.15, 0.15);
 				const leanAngle = random(0, TAU);
 				const side = new THREE.Vector3(Math.cos(leanAngle), 0, Math.sin(leanAngle));
 				const across = new THREE.Vector3(-side.z, 0, side.x);
-
 				const curve = new THREE.CatmullRomCurve3(
-					[0, 0.33, 0.66, 1].map((s) =>
+					[0, 0.25, 0.5, 0.75, 1].map((s) =>
 						base
 							.clone()
-							.add(new THREE.Vector3(0, height * s - 0.03, 0))
+							.add(new THREE.Vector3(0, height * s - 0.04, 0))
 							.addScaledVector(side, height * lean * s * s)
 							.addScaledVector(across, height * bend * Math.sin(Math.PI * s)),
 					),
 				);
 
-				const SEGMENTS = 24;
-				const AROUND = 20;
-				const ridges = randInt(5, 7);
-				const twist = random(-1, 1);
+				const SEGMENTS = 40;
+				const AROUND = 48;
+				const ridges = randInt(5, 6);
+				const ridgeSize = Array.from({ length: ridges }, () => random(0.7, 1.3));
+				const twist = random(-0.6, 0.6);
 				const frames = curve.computeFrenetFrames(SEGMENTS, false);
-				const jag = Array.from({ length: AROUND }, () => random(-0.018, 0.018));
-				const green = new THREE.Color("#5e6b2a");
-				const dry = new THREE.Color("#a08a5a");
+				const jag = Array.from({ length: AROUND }, () => random(-0.012, 0.012));
+				const valley = new THREE.Color("#3b3420");
+				const ridgeGreen = new THREE.Color("#6f6c40");
+				const ridgeDry = new THREE.Color("#a8956a");
+				const cutEnd = new THREE.Color("#9c8a5e");
+				const cutCore = new THREE.Color("#c2ae80");
 				const color = new THREE.Color();
 				const p = new THREE.Vector3();
 				const positions = [];
@@ -761,18 +1044,25 @@
 				for (let i = 0; i <= SEGMENTS; i++) {
 					const s = i / SEGMENTS;
 					const center = curve.getPointAt(s);
-					const flare = 1 + 1.1 * Math.exp(-s * 10);
+					const flare = 1 + 1.7 * Math.exp(-s * 9);
+					const ridgeDepth = 0.16 + 0.24 * Math.exp(-s * 6);
 					for (let k = 0; k < AROUND; k++) {
 						const a = (k / AROUND) * TAU;
-						const ridge = Math.cos(ridges * a + twist * s * 3);
-						const r = radius * flare * (1 - 0.25 * s) * (1 + 0.12 * ridge);
+						const turned = a + twist * s;
+						const ridge = Math.pow(Math.abs(Math.cos((turned * ridges) / 2)), 1.6);
+						const which = Math.floor(((((turned / TAU) % 1) + 1) % 1) * ridges);
+						const bumpy = 1 + 0.035 * (noise(k * 0.6, i * 0.45 + 300) - 0.5);
+						const r = radius * flare * (1 - 0.18 * s) * (1 - ridgeDepth * (1 - ridge) * ridgeSize[which]) * bumpy;
 						p.copy(center)
 							.addScaledVector(frames.normals[i], Math.cos(a) * r)
 							.addScaledVector(frames.binormals[i], Math.sin(a) * r);
-						// Broken-off, ragged tip.
 						if (i === SEGMENTS) p.addScaledVector(frames.tangents[i], jag[k]);
 						positions.push(p.x, p.y, p.z);
-						color.copy(green).lerp(dry, Math.min(1, s * 1.3 + 0.1)).multiplyScalar(0.8 + 0.2 * ridge);
+
+						const streak = noise(a * 5, s * 6 + 500);
+						color.copy(ridgeGreen).lerp(ridgeDry, clamp(s * 1.2 + 0.4 * streak - 0.1, 0, 1));
+						color.lerp(valley, (1 - ridge) * 0.7);
+						color.multiplyScalar(0.85 + 0.3 * streak);
 						colors.push(color.r, color.g, color.b);
 					}
 				}
@@ -785,19 +1075,17 @@
 					}
 				}
 
-				// Cap: a copy of the last ring (for a crisp edge) fanned to a center.
+				// Cut end: pale dry fibers, darker toward the rind.
 				const ring = positions.length / 3 - AROUND;
 				const capStart = ring + AROUND;
 				for (let k = 0; k < AROUND; k++) {
 					positions.push(...positions.slice((ring + k) * 3, (ring + k) * 3 + 3));
-					colors.push(0.55, 0.45, 0.28);
+					colors.push(cutEnd.r, cutEnd.g, cutEnd.b);
 				}
-				const tip = curve.getPointAt(1).addScaledVector(frames.tangents[SEGMENTS], -0.008);
+				const tip = curve.getPointAt(1).addScaledVector(frames.tangents[SEGMENTS], -0.01);
 				positions.push(tip.x, tip.y, tip.z);
-				colors.push(0.45, 0.36, 0.22);
-				for (let k = 0; k < AROUND; k++) {
-					index.push(capStart + AROUND, capStart + k, capStart + ((k + 1) % AROUND));
-				}
+				colors.push(cutCore.r, cutCore.g, cutCore.b);
+				for (let k = 0; k < AROUND; k++) index.push(capStart + AROUND, capStart + k, capStart + ((k + 1) % AROUND));
 
 				const geometry = new THREE.BufferGeometry();
 				geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
@@ -807,7 +1095,7 @@
 				return geometry;
 			}
 
-			// A vine that creeps across the top, then curls up off the surface.
+			// A dried vine that creeps across the top, then curls up off the surface.
 			function buildTendril(angle) {
 				const points = [];
 				const p = new THREE.Vector3();
@@ -817,20 +1105,19 @@
 
 				for (let k = 0; k <= 8; k++) {
 					const u = 0.5 + angle / TAU + 0.02 * Math.sin(k * 0.8 + wiggle);
-					const v = 0.01 + (reach * k) / 8;
+					const v = 0.02 + (reach * k) / 8;
 					surfacePoint(u, v, p);
 					surfaceNormal(u, v, n);
-					points.push(p.clone().addScaledVector(n, 0.02));
+					points.push(p.clone().addScaledVector(n, 0.015));
 				}
 
 				const end = points[points.length - 1];
 				const along = end.clone().sub(points[points.length - 2]).normalize();
 				const sideways = new THREE.Vector3().crossVectors(along, n);
 				const loops = random(1.5, 2.5);
-				const size = random(0.05, 0.08);
+				const size = random(0.04, 0.07);
 				const drift = random(-0.06, 0.06);
 				const center = end.clone().addScaledVector(n, size);
-
 				for (let k = 1; k <= 40; k++) {
 					const t = k / 40;
 					const a = t * loops * TAU;
@@ -843,19 +1130,17 @@
 							.addScaledVector(sideways, drift * t),
 					);
 				}
-
-				return new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 160, 0.008, 6, false);
+				return new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 160, 0.006, 6, false);
 			}
 
 			// =====================================================================
-			// Candle
-			// The flame, its glow and the light live for the whole session;
-			// buildCandle() makes new wax for each pumpkin and moves them onto it.
+			// Tealight
+			// A short candle in a crimped aluminium cup, sitting on the floor of
+			// the pumpkin. Its flame, glow and light are kept for the session.
 			// =====================================================================
 
-			// The flame: a camera-facing teardrop drawn by a small shader.
 			const flameMaterial = new THREE.ShaderMaterial({
-				uniforms: { uTime: { value: 0 }, uSway: { value: 0 } },
+				uniforms: { uTime: { value: 0 }, uSway: { value: 0 }, uPhase: { value: 0 } },
 				transparent: true,
 				depthWrite: false,
 				blending: THREE.AdditiveBlending,
@@ -869,12 +1154,13 @@
 				fragmentShader: `
 					uniform float uTime;
 					uniform float uSway;
+					uniform float uPhase;
 					varying vec2 vUv;
 
 					void main() {
 						float y = vUv.y;
 						// The tip sways more than the base.
-						float x = (vUv.x - 0.5) * 2.0 - (uSway + 0.06 * sin(uTime * 9.0 + y * 4.0)) * y * y;
+						float x = (vUv.x - 0.5) * 2.0 - (uSway + 0.06 * sin(uTime * 9.0 + uPhase + y * 4.0)) * y * y;
 						// Teardrop: round bottom, pointed top.
 						float width = y < 0.25
 							? sqrt(max(0.0, 1.0 - pow((0.25 - y) / 0.25, 2.0)))
@@ -890,11 +1176,10 @@
 				`,
 			});
 
-			const flameGeometry = new THREE.PlaneGeometry(0.065, 0.19);
-			flameGeometry.translate(0, 0.095, 0);
+			const flameGeometry = new THREE.PlaneGeometry(0.05, 0.14);
+			flameGeometry.translate(0, 0.07, 0);
 			const flame = new THREE.Mesh(flameGeometry, flameMaterial);
 
-			// A soft halo, seen only through the carving.
 			const [glowCanvas, glowCtx] = makeCanvas(128, 128);
 			const glowGradient = glowCtx.createRadialGradient(64, 64, 0, 64, 64, 64);
 			glowGradient.addColorStop(0, "rgba(255, 190, 110, 1)");
@@ -902,110 +1187,146 @@
 			glowGradient.addColorStop(1, "rgba(255, 120, 40, 0)");
 			glowCtx.fillStyle = glowGradient;
 			glowCtx.fillRect(0, 0, 128, 128);
-
 			const glow = new THREE.Sprite(
-				new THREE.SpriteMaterial({
-					map: colorTexture(glowCanvas),
-					blending: THREE.AdditiveBlending,
-					depthWrite: false,
-					opacity: 0.5,
-				}),
+				new THREE.SpriteMaterial({ map: colorTexture(glowCanvas), blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.5 }),
 			);
-			glow.scale.setScalar(0.7);
+			glow.scale.setScalar(0.45);
 
-			const CANDLE_INTENSITY = 4;
+			const CANDLE_INTENSITY = 4.5;
 			const candleLight = new THREE.PointLight("#ffa850", CANDLE_INTENSITY, 0, 1.5);
 			candleLight.castShadow = true;
 			candleLight.shadow.mapSize.set(1024, 1024);
-			candleLight.shadow.camera.near = 0.03;
-			candleLight.shadow.camera.far = 12;
+			candleLight.shadow.camera.near = 0.02;
+			candleLight.shadow.camera.far = 14;
 			candleLight.shadow.bias = -0.003;
 			const lightHome = new THREE.Vector3(); // where the light rests, before it sways
+			// Light bouncing around the orange walls: no shadows, so nothing inside
+			// goes pitch black.
+			const BOUNCE_INTENSITY = 0.5;
+			const bounceLight = new THREE.PointLight("#ff8a3a", BOUNCE_INTENSITY, 1.6, 1.2);
 
-			// The flame sits between the eyes and nose, so light pours out through
-			// the mouth and down onto the table.
-			function buildCandle() {
-				const floorY = surfacePoint(0, 1).y + SHELL;
-				const flameY = surfacePoint(0.5, faceV - 0.07).y;
-				const radius = random(0.1, 0.13);
-				const height = flameY - 0.08 - floorY;
+			const waxMaterial = new THREE.MeshPhysicalMaterial({
+				color: "#f3eee4",
+				roughness: 0.4,
+				clearcoat: 0.7, // the molten pool
+				clearcoatRoughness: 0.15,
+				emissive: "#ff9a50",
+				emissiveIntensity: 0.25,
+			});
+			const emberMaterial = new THREE.MeshStandardMaterial({ color: "#000", emissive: "#ff6a20", emissiveIntensity: 3 });
 
-				const candle = new THREE.Group();
-				candle.position.set(random(-0.05, 0.05), floorY - 0.01, random(-0.05, 0.05));
+			function buildTealight() {
+				rand = mulberry32(settings.seed + 5);
+				const R = 0.125;
+				const CUP = 0.1;
+				const tealight = new THREE.Group();
+				tealight.position.set(random(-0.04, 0.04), surfacePoint(0, 1).y + SHELL - 0.004, random(-0.04, 0.04));
 
-				// Body: a lathe with a melted pool on top, then pushed out of round.
-				const wax = new THREE.LatheGeometry(
+				// Cup: base, crimped wall, rolled lip, and the inside of the wall.
+				const cup = new THREE.LatheGeometry(
 					[
 						[0.001, 0],
-						[radius * 1.02, 0],
-						[radius, 0.02],
-						[radius * 0.99, height * 0.6],
-						[radius * 1.01, height - 0.025],
-						[radius * 0.95, height],
-						[radius * 0.75, height - 0.008],
-						[0.001, height - 0.02],
+						[R - 0.004, 0],
+						[R, 0.004],
+						[R, CUP - 0.003],
+						[R - 0.0015, CUP],
+						[R - 0.003, CUP - 0.003],
+						[R - 0.003, CUP - 0.02],
 					].map(([r, y]) => new THREE.Vector2(r, y)),
-					40,
+					72,
 				);
-				const phase = random(0, TAU);
-				const position = wax.attributes.position;
+				const dents = random(0, TAU);
+				const position = cup.attributes.position;
 				for (let i = 0; i < position.count; i++) {
 					const x = position.getX(i);
 					const y = position.getY(i);
 					const z = position.getZ(i);
+					if (Math.hypot(x, z) < R * 0.9 || y < 0.004) continue;
 					const a = Math.atan2(z, x);
-					const k = 1 + 0.03 * Math.sin(3 * a + y * 8 + phase) + 0.015 * Math.sin(7 * a + phase);
+					const k = 1 + 0.012 * Math.abs(Math.sin(a * 30)) - 0.006 + 0.01 * Math.sin(a * 2 + dents) * (y / CUP);
 					position.setXYZ(i, x * k, y, z * k);
 				}
-				wax.computeVertexNormals();
+				cup.computeVertexNormals();
+				const cupMesh = new THREE.Mesh(cup, new THREE.MeshStandardMaterial({ color: "#d9d9d9", metalness: 0.85, roughness: 0.32 }));
+				cupMesh.castShadow = true;
+				cupMesh.receiveShadow = true;
 
-				const body = new THREE.Mesh(wax, waxMaterial);
-				body.castShadow = true;
-				body.receiveShadow = true;
-				candle.add(body);
-
-				for (let i = 0, count = randInt(3, 5); i < count; i++) {
-					const length = random(0.04, 0.14);
-					const a = random(0, TAU);
-					const drip = new THREE.Mesh(new THREE.CapsuleGeometry(random(0.012, 0.02), length, 4, 8), waxMaterial);
-					drip.position.set(Math.cos(a) * radius, height - 0.02 - length / 2, Math.sin(a) * radius);
-					drip.rotation.y = -a;
-					drip.scale.x = 0.6; // flatten against the candle
-					candle.add(drip);
-				}
-
-				const wickTop = new THREE.Vector3(random(-0.008, 0.008), height + 0.03, random(-0.008, 0.008));
-				const wick = new THREE.QuadraticBezierCurve3(
-					new THREE.Vector3(0, height - 0.03, 0),
-					new THREE.Vector3(0, height + 0.015, 0),
-					wickTop,
+				// Wax: nearly fills the cup, dipping into a pool around the wick.
+				const waxTop = CUP - 0.018;
+				const wax = new THREE.Mesh(
+					new THREE.LatheGeometry(
+						[
+							[R - 0.004, 0.004],
+							[R - 0.004, waxTop],
+							[R * 0.6, waxTop - 0.002],
+							[0.001, waxTop - 0.005],
+						].map(([r, y]) => new THREE.Vector2(r, y)),
+						48,
+					),
+					waxMaterial,
 				);
-				candle.add(new THREE.Mesh(new THREE.TubeGeometry(wick, 8, 0.0045, 6), wickMaterial));
+				wax.receiveShadow = true;
 
-				const ember = new THREE.Mesh(new THREE.SphereGeometry(0.006, 8, 6), emberMaterial);
+				const wickTop = new THREE.Vector3(random(-0.005, 0.005), waxTop + 0.02, random(-0.005, 0.005));
+				const wick = new THREE.Mesh(
+					new THREE.TubeGeometry(
+						new THREE.QuadraticBezierCurve3(new THREE.Vector3(0, waxTop - 0.006, 0), new THREE.Vector3(0, waxTop + 0.012, 0), wickTop),
+						8,
+						0.003,
+						6,
+					),
+					new THREE.MeshStandardMaterial({ color: "#1b130d", roughness: 1 }),
+				);
+				const ember = new THREE.Mesh(new THREE.SphereGeometry(0.004, 8, 6), emberMaterial);
 				ember.position.copy(wickTop);
 
-				flame.position.copy(wickTop).y -= 0.025;
-				glow.position.copy(wickTop).y += 0.06;
-				lightHome.copy(wickTop).y += 0.05;
+				flame.position.copy(wickTop).y -= 0.012;
+				glow.position.copy(wickTop).y += 0.04;
+				lightHome.copy(wickTop).y += 0.035;
 				candleLight.position.copy(lightHome);
-				candle.add(ember, flame, glow, candleLight);
-				return candle;
+				bounceLight.position.set(0, 0.35, 0);
+				tealight.add(cupMesh, wax, wick, ember, flame, glow, candleLight, bounceLight);
+				return tealight;
+			}
+
+			// Seeds and stringy pulp the carver missed, lying on the floor inside.
+			function buildLeftovers() {
+				rand = mulberry32(settings.seed + 6);
+				const group = new THREE.Group();
+				const p = new THREE.Vector3();
+				const n = new THREE.Vector3();
+				const up = new THREE.Vector3(0, 1, 0);
+				const insidePoint = (u, v, lift) => {
+					surfacePoint(u, v, p);
+					surfaceNormal(u, v, n);
+					return p.clone().addScaledVector(n, -SHELL - lift);
+				};
+
+				const seedGeometry = new THREE.SphereGeometry(1, 12, 6);
+				const seedMaterial = new THREE.MeshStandardMaterial({ color: "#eadcb4", roughness: 0.5 });
+				for (let i = 0; i < 10; i++) {
+					const seed = new THREE.Mesh(seedGeometry, seedMaterial);
+					seed.position.copy(insidePoint(random(0, 1), random(0.84, 0.93), 0.006));
+					seed.scale.set(0.034, 0.007, 0.021);
+					seed.quaternion.setFromUnitVectors(up, n.clone().negate()).multiply(new THREE.Quaternion().setFromAxisAngle(up, random(0, TAU)));
+					seed.receiveShadow = true;
+					group.add(seed);
+				}
+
+				const pulpMaterial = new THREE.MeshStandardMaterial({ color: "#e08a2a", roughness: 0.45 });
+				for (let i = 0; i < 4; i++) {
+					const u0 = random(0, 1);
+					const points = Array.from({ length: 6 }, (_, k) => insidePoint(u0 + k * random(0.01, 0.025), random(0.82, 0.92), 0.008));
+					const strand = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 40, random(0.005, 0.01), 5), pulpMaterial);
+					strand.receiveShadow = true;
+					group.add(strand);
+				}
+				return group;
 			}
 
 			// =====================================================================
 			// Build the pumpkin
-			// Runs on load, for a new seed or face, and when a shape slider moves.
-			// Each part draws from its own seeded stream, so moving a slider
-			// reshapes this pumpkin instead of rolling a new one.
 			// =====================================================================
-
-			let pumpkin = null;
-			// The lid swings around the middle of its cut. lidHome is where it sits
-			// on the pumpkin, lidRest is where it lands on the table.
-			let lidPivot = null;
-			const lidHome = new THREE.Vector3();
-			const lidRest = new THREE.Vector3();
 
 			function shellMesh(geometry, material) {
 				const mesh = new THREE.Mesh(geometry, material);
@@ -1014,92 +1335,59 @@
 				return mesh;
 			}
 
-			function buildPumpkin() {
-				if (skinDirty) {
-					rand = mulberry32(settings.seed + 3);
-					paintSkin();
-				}
+			const lidRing = Array.from({ length: COLS }, (_, i) => [i / COLS, lidCut(i / COLS)]);
+			const [bodySkin, bodyFlesh] = buildShell(200, (u) => [lidCut(u), 1]);
+			const [lidSkin, lidFlesh] = buildShell(40, (u) => [0, lidCut(u)]);
 
-				rand = mulberry32(settings.seed + 1);
-				const holes = FACES[settings.face]().map((shape) =>
-					orient(wobble(densify(shape, 0.012), 0.004).map(toUV)),
-				);
-				drawMask(holes);
-
-				rand = mulberry32(settings.seed + 2);
-				const lidRing = Array.from({ length: COLS }, (_, i) => [i / COLS, lidCut(i / COLS)]);
-				const [bodySkin, bodyFlesh] = buildShell(110, (u) => [lidCut(u), 1]);
-				const [lidSkin, lidFlesh] = buildShell(24, (u) => [0, lidCut(u)]);
-
-				const lid = new THREE.Group();
-				lid.add(
-					shellMesh(lidSkin, skinMaterial),
-					shellMesh(lidFlesh, fleshMaterial),
-					shellMesh(buildRim([lidRing]), cutMaterial),
-				);
-
-				const stem = new THREE.Mesh(buildStem(), stemMaterial);
-				stem.castShadow = true;
-				lid.add(stem);
-
-				const firstTendril = random(0, TAU);
-				for (let i = 0, count = randInt(2, 3); i < count; i++) {
-					const tendril = new THREE.Mesh(buildTendril(firstTendril + (i * TAU) / count + random(-0.5, 0.5)), tendrilMaterial);
-					tendril.castShadow = true;
-					lid.add(tendril);
-				}
-
-				const ringPoints = lidRing.map(([u, v]) => surfacePoint(u, v));
-				const ringY = ringPoints.reduce((sum, p) => sum + p.y, 0) / ringPoints.length;
-				const ringBottom = Math.min(...ringPoints.map((p) => p.y)) - SHELL * 0.8; // inner edge sits a bit lower
-				const ringRadius = Math.max(...ringPoints.map((p) => Math.hypot(p.x, p.z)));
-				lid.position.y = -ringY;
-				lidPivot = new THREE.Group();
-				lidPivot.add(lid);
-
-				const group = new THREE.Group();
-				group.add(
-					shellMesh(bodySkin, skinMaterial),
-					shellMesh(bodyFlesh, fleshMaterial),
-					shellMesh(buildRim([[...lidRing].reverse(), ...holes]), cutMaterial),
-					lidPivot,
-					buildCandle(), // also moves the flame and light off the old pumpkin
-				);
-
-				bodySkin.computeBoundingBox();
-				group.position.y = -bodySkin.boundingBox.min.y;
-				group.rotation.y = turn;
-				lidHome.set(0, ringY, 0);
-				// Beside the pumpkin (on the side away from the panel), resting on its cut edge.
-				lidRest.set(-(settings.width + ringRadius + 0.2), ringY - ringBottom - group.position.y, 0.35);
-
-				if (pumpkin) {
-					scene.remove(pumpkin);
-					pumpkin.traverse((object) => object.geometry?.dispose());
-				}
-				pumpkin = group;
-				scene.add(pumpkin);
-				controls.target.set(0, pumpkin.position.y * 0.85, 0);
-				moon.shadow.needsUpdate = true;
+			const lid = new THREE.Group();
+			lid.add(shellMesh(lidSkin, skinMaterial), shellMesh(lidFlesh, fleshMaterial), shellMesh(buildRim([lidRing]), cutMaterial));
+			const stem = new THREE.Mesh(buildStem(), stemMaterial);
+			stem.castShadow = true;
+			lid.add(stem);
+			rand = mulberry32(settings.seed + 7);
+			const firstTendril = random(0, TAU);
+			for (let i = 0, count = randInt(1, 2); i < count; i++) {
+				const tendril = new THREE.Mesh(buildTendril(firstTendril + (i * TAU) / count + random(-0.5, 0.5)), tendrilMaterial);
+				tendril.castShadow = true;
+				lid.add(tendril);
 			}
+
+			// Wireframes of the shells, shown only where the cutaway opens them.
+			const wires = [bodySkin, bodyFlesh, lidSkin, lidFlesh].map((geometry) => new THREE.Mesh(geometry, wireMaterial));
+			wires.forEach((wire) => (wire.renderOrder = 1));
+
+			const pumpkin = new THREE.Group();
+			pumpkin.add(
+				shellMesh(bodySkin, skinMaterial),
+				shellMesh(bodyFlesh, fleshMaterial),
+				shellMesh(buildRim([[...lidRing].reverse(), ...holes]), cutMaterial),
+				lid,
+				buildTealight(),
+				buildLeftovers(),
+				...wires.slice(0, 2),
+			);
+			lid.add(...wires.slice(2));
+
+			bodySkin.computeBoundingBox();
+			pumpkin.position.y = -bodySkin.boundingBox.min.y;
+			pumpkin.rotation.y = turn;
+			scene.add(pumpkin);
+			const pumpkinCenter = new THREE.Vector3(0, pumpkin.position.y, 0);
+			const pumpkinReach = Math.max(W, H) + 0.4; // beyond this the cutaway can't touch it
 
 			// =====================================================================
 			// Table
+			// A small, rickety table: four warped planks on crooked legs.
 			// =====================================================================
 
-			rand = mulberry32(1031); // fixed seed: the table and sky are the same for every pumpkin
+			rand = mulberry32(1031); // fixed seed: the setting is the same for every pumpkin
 			const woodNoise = makeNoise();
-			const scorch = { x: random(1.3, 1.9), z: random(-0.7, 0.3), r: random(0.4, 0.55) };
+			const TABLE_LEG = 4.6; // tabletop to ground
 
-			// Grain, knots, wear, a faint scorch ring, and cracks, for one plank.
-			// Returns a color map and a matching bump map.
-			function woodTextures(length, width, originX, originZ) {
+			// Grain, knots, wear and cracks for one board. Returns color and bump.
+			function woodTextures(length, width) {
 				const w = 1024;
-				const h = Math.round((1024 * width) / length);
-				const [colorCanvas, colorCtx] = makeCanvas(w, h);
-				const [bumpCanvas, bumpCtx] = makeCanvas(w, h);
-				const color = colorCtx.createImageData(w, h);
-				const bump = bumpCtx.createImageData(w, h);
+				const h = Math.max(64, Math.round((1024 * width) / length));
 				const offset = random(0, 100);
 				const knots = Array.from({ length: randInt(0, 2) }, () => ({
 					x: random(0.3, length - 0.3),
@@ -1107,42 +1395,29 @@
 					r: random(0.03, 0.06),
 				}));
 
-				for (let y = 0; y < h; y++) {
-					for (let x = 0; x < w; x++) {
-						const X = (x / w) * length;
-						const Z = (y / h) * width;
-						let rings =
-							Z * (12 + 10 * woodNoise(X * 0.3 + offset, Z * 3)) +
-							3 * woodNoise(X * 0.4 + offset, offset) +
-							1.5 * woodNoise(X * 1.5 + offset, Z * 8);
-						let knot = 0;
-						for (const k of knots) {
-							const d2 = ((X - k.x) ** 2 + (Z - k.z) ** 2) / (k.r * k.r);
-							rings += 3 * Math.exp(-d2 * 0.3); // grain bends around the knot
-							knot = Math.max(knot, Math.exp(-d2 * 1.5));
-						}
-						const grain = Math.sin((rings - Math.floor(rings)) * Math.PI) ** 2;
-						const fiber = woodNoise(X * 3 + offset, Z * 140);
-						const blotch = woodNoise(X * 0.7 + offset, Z * 2.5 + offset);
-
-						let tone = 0.35 + 0.3 * grain + 0.2 * fiber + 0.35 * (blotch - 0.5);
-						tone *= 1 - 0.7 * knot;
-						const sd = Math.hypot(originX + X - scorch.x, originZ + Z - scorch.z);
-						tone *= 1 - 0.35 * Math.exp(-(((sd - scorch.r) / 0.05) ** 2)) - (sd < scorch.r ? 0.12 : 0);
-
-						const i = (y * w + x) * 4;
-						color.data[i] = 38 + 90 * tone;
-						color.data[i + 1] = 27 + 64 * tone;
-						color.data[i + 2] = 18 + 42 * tone;
-						color.data[i + 3] = 255;
-						bump.data[i] = bump.data[i + 1] = bump.data[i + 2] = 255 * (0.35 + 0.35 * grain + 0.3 * fiber);
-						bump.data[i + 3] = 255;
+				const [[colorCanvas, colorCtx], [bumpCanvas, bumpCtx]] = paintCanvases(w, h, 2, (x, y, out) => {
+					const X = (x / w) * length;
+					const Z = (y / h) * width;
+					let rings = Z * (12 + 10 * woodNoise(X * 0.3 + offset, Z * 3)) + 3 * woodNoise(X * 0.4 + offset, offset) + 1.5 * woodNoise(X * 1.5 + offset, Z * 8);
+					let knot = 0;
+					for (const k of knots) {
+						const d2 = ((X - k.x) ** 2 + (Z - k.z) ** 2) / (k.r * k.r);
+						rings += 3 * Math.exp(-d2 * 0.3);
+						knot = Math.max(knot, Math.exp(-d2 * 1.5));
 					}
-				}
-				colorCtx.putImageData(color, 0, 0);
-				bumpCtx.putImageData(bump, 0, 0);
+					const grain = Math.sin((rings - Math.floor(rings)) * Math.PI) ** 2;
+					const fiber = woodNoise(X * 3 + offset, Z * 140);
+					const blotch = woodNoise(X * 0.7 + offset, Z * 2.5 + offset);
+					// Edges and ends are worn paler and greyer.
+					const edge = Math.max(smoothstep(0.25, 0, Math.min(Z, width - Z)), smoothstep(0.3, 0, Math.min(X, length - X)));
+					let tone = (0.35 + 0.3 * grain + 0.2 * fiber + 0.35 * (blotch - 0.5)) * (1 - 0.7 * knot);
+					tone += 0.15 * edge;
+					out[0][0] = 38 + 90 * tone;
+					out[0][1] = 27 + 66 * tone;
+					out[0][2] = 18 + 46 * tone;
+					out[1][0] = out[1][1] = out[1][2] = 255 * (0.35 + 0.35 * grain + 0.3 * fiber);
+				});
 
-				// Scratches from years of use.
 				for (let i = 0; i < 30; i++) {
 					const x = random(0, w);
 					const y = random(0, h);
@@ -1156,17 +1431,18 @@
 					colorCtx.stroke();
 				}
 
-				// Cracks: tapering random walks along the grain, mostly from the ends.
 				for (let c = 0, count = randInt(1, 3); c < count; c++) {
-					const fromEnd = rand() < 0.65;
-					let x = fromEnd ? (rand() < 0.5 ? 0 : w) : random(0.2, 0.8) * w;
+					let x = rand() < 0.65 ? (rand() < 0.5 ? 0 : w) : random(0.2, 0.8) * w;
 					let y = random(0.15, 0.85) * h;
 					const dir = x === 0 ? 1 : x === w ? -1 : rand() < 0.5 ? 1 : -1;
 					const steps = randInt(15, 50);
 					for (let s = 0; s < steps; s++) {
 						const nx = x + dir * random(4, 10);
-						const ny = Math.min(h - 2, Math.max(2, y + random(-1.5, 1.5)));
-						for (const [ctx, style] of [[colorCtx, "rgba(12, 7, 4, 0.9)"], [bumpCtx, "#000"]]) {
+						const ny = clamp(y + random(-1.5, 1.5), 2, h - 2);
+						for (const [ctx, style] of [
+							[colorCtx, "rgba(12, 7, 4, 0.9)"],
+							[bumpCtx, "#000"],
+						]) {
 							ctx.strokeStyle = style;
 							ctx.lineWidth = 2.6 * (1 - s / steps) + 0.4;
 							ctx.beginPath();
@@ -1179,15 +1455,18 @@
 					}
 				}
 
-				const bumpTexture = new THREE.CanvasTexture(bumpCanvas);
-				bumpTexture.anisotropy = 8;
-				return [colorTexture(colorCanvas), bumpTexture];
+				return [colorTexture(colorCanvas), dataTexture(bumpCanvas)];
 			}
 
-			// A warped plank: cupped across, bowed along, twisted, with ragged
+			function woodMaterial(length, width) {
+				const [map, bumpMap] = woodTextures(length, width);
+				return new THREE.MeshStandardMaterial({ map, bumpMap, bumpScale: 2, roughness: 0.85 });
+			}
+
+			// A warped board: cupped across, bowed along, twisted, with ragged
 			// ends and worn edges.
 			function buildPlank(length, width, thickness) {
-				const geometry = new THREE.BoxGeometry(length, thickness, width, 48, 1, 8);
+				const geometry = new THREE.BoxGeometry(length, thickness, width, 40, 1, 8);
 				const position = geometry.attributes.position;
 				const cup = random(-0.015, 0.015);
 				const bow = random(-0.02, 0.012);
@@ -1201,72 +1480,99 @@
 					let z = position.getZ(i);
 					const nx = x / (length / 2);
 					const nz = z / (width / 2);
-
-					if (Math.abs(nx) > 0.999) {
-						x += Math.sign(x) * (slant[x > 0 ? 1 : 0] * nz - 0.06 * woodNoise(z * 25 + offset, x > 0 ? 7 : 3));
-					}
-					if (Math.abs(nz) > 0.999) {
-						z -= Math.sign(z) * 0.02 * woodNoise(x * 3 + offset, z > 0 ? 1 : 9);
-					}
+					if (Math.abs(nx) > 0.999) x += Math.sign(x) * (slant[x > 0 ? 1 : 0] * nz - 0.06 * woodNoise(z * 25 + offset, x > 0 ? 7 : 3));
+					if (Math.abs(nz) > 0.999) z -= Math.sign(z) * 0.02 * woodNoise(x * 3 + offset, z > 0 ? 1 : 9);
+					// Worn, rounded top edges.
+					if (y > 0) y -= 0.012 * smoothstep(0.85, 1, Math.abs(nz));
 					y += cup * nz * nz + bow * (1 - nx * nx) + twist * nx * nz;
 					position.setXYZ(i, x, y, z);
 				}
-
 				geometry.computeVertexNormals();
 				return geometry;
 			}
 
 			const table = new THREE.Group();
-			const plankWidths = Array.from({ length: 6 }, () => random(0.5, 0.68));
+			const plankWidths = Array.from({ length: 4 }, () => random(0.6, 0.72));
 			const gaps = plankWidths.map(() => random(0.012, 0.03));
 			const tableDepth = plankWidths.reduce((sum, w, i) => sum + w + gaps[i], 0);
+			const tableLength = 4;
+			const plankBoxes = []; // [center, size] for each board, for physics later
 			let plankZ = -tableDepth / 2;
-			let frameMaterial;
 
 			for (let i = 0; i < plankWidths.length; i++) {
 				const width = plankWidths[i];
-				const length = random(5.4, 6.2);
-				const thickness = random(0.1, 0.13);
-				const x = random(-0.25, 0.25);
-				const z = plankZ + width / 2;
-				const [map, bumpMap] = woodTextures(length, width, x - length / 2, plankZ);
-				const material = new THREE.MeshStandardMaterial({ map, bumpMap, bumpScale: 2, roughness: 0.85 });
-				frameMaterial ??= material;
-
-				const plank = new THREE.Mesh(buildPlank(length, width, thickness), material);
-				plank.position.set(x, -thickness / 2 + random(-0.008, 0.004), z);
+				const length = tableLength + random(-0.15, 0.2);
+				const thickness = random(0.1, 0.12);
+				const plank = new THREE.Mesh(buildPlank(length, width, thickness), woodMaterial(length, width));
+				plank.position.set(random(-0.12, 0.12), -thickness / 2 + random(-0.008, 0.004), plankZ + width / 2);
 				plank.rotation.y = random(-0.012, 0.012);
 				plank.castShadow = true;
 				plank.receiveShadow = true;
 				table.add(plank);
+				plankBoxes.push([plank.position.clone(), new THREE.Vector3(length, thickness, width)]);
 				plankZ += width + gaps[i];
 			}
 
-			// Cleats under the planks and crooked legs.
+			// Frame: an apron under the top, crooked splayed legs, and one
+			// diagonal brace somebody nailed on to stop the wobble.
+			const frameMaterial = woodMaterial(4.6, 0.2);
+			const legX = tableLength / 2 - 0.35;
+			const legZ = tableDepth / 2 - 0.22;
 			for (const side of [-1, 1]) {
-				const cleat = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.12, tableDepth - 0.1), frameMaterial);
-				cleat.position.set(side * 2.2, -0.19, 0);
-				cleat.receiveShadow = true;
-				table.add(cleat);
+				const apronLong = new THREE.Mesh(new THREE.BoxGeometry(tableLength - 0.6, 0.32, 0.07), frameMaterial);
+				apronLong.position.set(0, -0.3, side * (legZ - 0.02));
+				apronLong.rotation.x = random(-0.03, 0.03);
+				const apronShort = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.32, tableDepth - 0.4), frameMaterial);
+				apronShort.position.set(side * (legX - 0.02), -0.3, 0);
+				table.add(apronLong, apronShort);
 
 				for (const end of [-1, 1]) {
-					const leg = new THREE.Mesh(new THREE.BoxGeometry(0.16, 2.6, 0.16), frameMaterial);
-					leg.position.set(side * 2.2, -1.55, end * (tableDepth / 2 - 0.25));
-					leg.rotation.set(random(-0.04, 0.04), 0, random(-0.04, 0.04));
+					const leg = new THREE.Mesh(new THREE.BoxGeometry(0.17, TABLE_LEG, 0.17, 1, 6, 1), frameMaterial);
+					const position = leg.geometry.attributes.position;
+					const bend = random(-0.05, 0.05);
+					for (let i = 0; i < position.count; i++) {
+						const t = position.getY(i) / TABLE_LEG + 0.5;
+						position.setX(i, position.getX(i) + bend * Math.sin(Math.PI * t));
+					}
+					leg.geometry.computeVertexNormals();
+					leg.position.set(side * legX, -0.12 - TABLE_LEG / 2, end * legZ);
+					leg.rotation.set(end * random(0.01, 0.03), 0, -side * random(0.01, 0.035)); // splayed
+					leg.castShadow = true;
 					leg.receiveShadow = true;
 					table.add(leg);
 				}
 			}
-			table.position.z = 0.5; // more tabletop in front, where the mouth light lands
+			const brace = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.12, Math.hypot(tableDepth - 0.4, 2.6)), frameMaterial);
+			brace.position.set(legX + 0.1, -2.6, 0);
+			brace.rotation.x = Math.atan2(2.6, tableDepth - 0.4);
+			table.add(brace);
+			table.traverse((object) => object.isMesh && (object.receiveShadow = true));
+			table.position.z = 0.15;
 			scene.add(table);
 
 			// =====================================================================
-			// Night sky
+			// Ground and sky
 			// =====================================================================
+
+			const groundY = -0.12 - TABLE_LEG;
+			const [[groundCanvas]] = paintCanvases(512, 512, 1, (x, y, out) => {
+				const n = woodNoise(x * 0.05 + 500, y * 0.05) * 0.6 + woodNoise(x * 0.3 + 700, y * 0.3) * 0.4;
+				out[0][0] = 26 + 26 * n;
+				out[0][1] = 23 + 22 * n;
+				out[0][2] = 18 + 14 * n;
+			});
+			const groundMap = colorTexture(groundCanvas);
+			groundMap.wrapS = groundMap.wrapT = THREE.RepeatWrapping;
+			groundMap.repeat.set(30, 30);
+			const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshStandardMaterial({ map: groundMap, roughness: 1 }));
+			ground.rotation.x = -Math.PI / 2;
+			ground.position.y = groundY;
+			ground.receiveShadow = true;
+			scene.add(ground);
 
 			scene.add(
 				new THREE.Mesh(
-					new THREE.SphereGeometry(80, 32, 16),
+					new THREE.SphereGeometry(300, 32, 16),
 					new THREE.ShaderMaterial({
 						side: THREE.BackSide,
 						depthWrite: false,
@@ -1281,7 +1587,7 @@
 							varying vec3 vDirection;
 							void main() {
 								float h = vDirection.y;
-								vec3 color = mix(vec3(0.06, 0.07, 0.16), vec3(0.008, 0.01, 0.03), smoothstep(-0.05, 0.6, h));
+								vec3 color = mix(vec3(0.1, 0.12, 0.17), vec3(0.008, 0.01, 0.03), smoothstep(-0.02, 0.45, h));
 								color *= smoothstep(-0.5, 0.0, h) * 0.8 + 0.2;
 								gl_FragColor = vec4(color, 1.0);
 							}
@@ -1295,19 +1601,17 @@
 			const starSizes = new Float32Array(STAR_COUNT);
 			const starPhases = new Float32Array(STAR_COUNT);
 			for (let i = 0; i < STAR_COUNT; i++) {
-				const y = random(-0.15, 1);
+				const y = random(-0.05, 1);
 				const a = random(0, TAU);
 				const r = Math.sqrt(1 - y * y);
-				starPositions.set([Math.cos(a) * r * 70, y * 70, Math.sin(a) * r * 70], i * 3);
+				starPositions.set([Math.cos(a) * r * 280, y * 280, Math.sin(a) * r * 280], i * 3);
 				starSizes[i] = 1 + 2.4 * rand() ** 3;
 				starPhases[i] = random(0, 1);
 			}
-
 			const starGeometry = new THREE.BufferGeometry();
 			starGeometry.setAttribute("position", new THREE.BufferAttribute(starPositions, 3));
 			starGeometry.setAttribute("size", new THREE.BufferAttribute(starSizes, 1));
 			starGeometry.setAttribute("phase", new THREE.BufferAttribute(starPhases, 1));
-
 			const starMaterial = new THREE.ShaderMaterial({
 				uniforms: { uTime: { value: 0 }, uPixelRatio: { value: renderer.getPixelRatio() } },
 				transparent: true,
@@ -1335,206 +1639,2322 @@
 			scene.add(new THREE.Points(starGeometry, starMaterial));
 
 			// =====================================================================
-			// Night lighting
+			// Physics
+			// Rapier, in scene units (1 unit ≈ 15 cm), so gravity is scaled up.
+			// Static: ground, tabletop, pumpkin shell, candles, jar, bottle, doll.
+			// Dynamic: the lid and the small things you can pick up.
 			// =====================================================================
 
-			scene.add(new THREE.HemisphereLight("#5d6688", "#1a120c", 1.6));
+			await RAPIER.init();
+			const world = new RAPIER.World({ x: 0, y: -9.81 / 0.15, z: 0 });
+			const PHYSICS_STEP = 1 / 60;
+			const dynamicBodies = []; // { body, object }: objects follow their bodies
+			const _v = new THREE.Vector3();
+			const _q = new THREE.Quaternion();
 
-			const moon = new THREE.DirectionalLight("#c3ccef", 1.6);
-			moon.position.set(-4, 6, -1);
-			moon.castShadow = true;
-			moon.shadow.mapSize.set(1024, 1024);
-			Object.assign(moon.shadow.camera, { left: -3.5, right: 3.5, top: 3.5, bottom: -3.5, near: 0.5, far: 20 });
-			moon.shadow.bias = -0.0005;
-			moon.shadow.normalBias = 0.02;
-			// Nothing in the moonlight moves, so its shadow only renders when
-			// buildPumpkin() asks for it.
-			moon.shadow.autoUpdate = false;
-			scene.add(moon);
-
-			// =====================================================================
-			// Control panel
-			// =====================================================================
-
-			const style = document.createElement("style");
-			style.textContent = `
-				.panel {
-					position: fixed; top: 12px; right: 12px; width: 240px; max-width: calc(100vw - 24px);
-					box-sizing: border-box; padding: 10px 14px; border-radius: 10px;
-					background: rgba(14, 10, 8, 0.8); border: 1px solid rgba(255, 170, 90, 0.2);
-					color: #e8d8bf; font: 13px/1.3 system-ui, sans-serif; backdrop-filter: blur(6px);
-				}
-				.panel summary { cursor: pointer; font-weight: 600; color: #ffb366; }
-				.panel label { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 9px 0; }
-				.panel input[type="range"] { width: 120px; accent-color: #ff9a3c; }
-				.panel input[type="checkbox"] { width: 16px; height: 16px; accent-color: #ff9a3c; }
-				.panel input[type="number"], .panel select {
-					width: 120px; box-sizing: border-box; padding: 4px 6px; border-radius: 6px;
-					background: #1f1712; color: inherit; border: 1px solid #4a3626; font: inherit;
-				}
-				.panel button {
-					width: 100%; margin: 4px 0; padding: 7px 8px; border-radius: 6px; cursor: pointer;
-					background: #3a2616; color: inherit; border: 1px solid #6b4a2c; font: inherit;
-				}
-				.panel button:hover { background: #4d321c; }
-				.hint {
-					position: fixed; bottom: 14px; left: 0; right: 0; text-align: center; pointer-events: none;
-					color: #c9b9a0; font: 13px system-ui, sans-serif; opacity: 0.6;
-				}
-			`;
-			document.head.appendChild(style);
-
-			const panel = document.createElement("details");
-			panel.className = "panel";
-			panel.open = innerWidth > 600; // start folded on phones
-			panel.innerHTML = `
-				<summary>Pumpkin</summary>
-				<label>Seed <input id="seed" type="number" min="1" step="1" /></label>
-				<button id="newPumpkin">New pumpkin</button>
-				<label>Face
-					<select id="face">${FACE_NAMES.map((name) => `<option value="${name}">${name}</option>`).join("")}</select>
-				</label>
-				<label>Width <input id="width" type="range" min="0.8" max="1.25" step="0.01" /></label>
-				<label>Height <input id="height" type="range" min="0.6" max="0.95" step="0.01" /></label>
-				<label>Grooves <input id="grooves" type="range" min="0" max="2.5" step="0.05" /></label>
-				<label>Candle brightness <input id="brightness" type="range" min="0" max="2" step="0.05" /></label>
-				<label>Candle lit <input id="candleLit" type="checkbox" /></label>
-				<label>Lid off <input id="lidOff" type="checkbox" /></label>
-				<label>Auto-rotate <input id="autoRotate" type="checkbox" /></label>
-				<label>Wireframe <input id="wireframe" type="checkbox" /></label>
-				<button id="screenshot">Save screenshot</button>
-			`;
-			document.body.appendChild(panel);
-
-			const hint = document.createElement("div");
-			hint.className = "hint";
-			hint.textContent = "drag to turn · scroll or pinch to zoom";
-			document.body.appendChild(hint);
-
-			// Every control's id matches its key in `settings`.
-			const ui = Object.fromEntries([...panel.querySelectorAll("[id]")].map((el) => [el.id, el]));
-
-			function syncPanel() {
-				for (const key of ["seed", "face", "width", "height", "grooves", "brightness"]) ui[key].value = settings[key];
-				for (const key of ["candleLit", "lidOff", "autoRotate", "wireframe"]) ui[key].checked = settings[key];
+			function addStatic(desc, x, y, z) {
+				return world.createCollider(desc.setTranslation(x, y, z));
 			}
 
-			function applyToggles() {
-				controls.autoRotate = settings.autoRotate;
-				for (const material of pumpkinMaterials) material.wireframe = settings.wireframe;
-			}
-
-			// Slider drags fire many events; rebuild at most once per frame.
-			let rebuildQueued = false;
-			function queueRebuild() {
-				if (rebuildQueued) return;
-				rebuildQueued = true;
-				requestAnimationFrame(() => {
-					rebuildQueued = false;
-					buildPumpkin();
+			// Vertices of an object's meshes (every `step`th), relative to `frame`'s
+			// position and rotation (not its scale, since bodies don't scale).
+			function pointsIn(object, frame = object, step = 1) {
+				object.updateMatrixWorld(true);
+				frame.updateMatrixWorld(true);
+				const inverse = new THREE.Matrix4()
+					.compose(frame.getWorldPosition(new THREE.Vector3()), frame.getWorldQuaternion(new THREE.Quaternion()), new THREE.Vector3(1, 1, 1))
+					.invert();
+				const points = [];
+				object.traverse((child) => {
+					if (!child.isMesh) return;
+					const position = child.geometry.attributes.position;
+					const toFrame = inverse.clone().multiply(child.matrixWorld);
+					for (let i = 0; i < position.count; i += step) {
+						_v.fromBufferAttribute(position, i).applyMatrix4(toFrame);
+						points.push(_v.x, _v.y, _v.z);
+					}
 				});
+				return new Float32Array(points);
 			}
 
-			function newPumpkin(seed) {
-				settings.seed = seed;
-				rollShape();
-				buildPumpkin();
-				syncPanel();
-				saveToURL();
+			const hull = (object, step = 1) => RAPIER.ColliderDesc.convexHull(pointsIn(object, object, step));
+
+			// A dynamic body for an object already placed in world space (a direct
+			// child of the scene).
+			function addDynamic(object, colliders, { density = 1, friction = 0.6, restitution = 0.1, asleep = false } = {}) {
+				object.updateMatrixWorld(true);
+				const body = world.createRigidBody(
+					RAPIER.RigidBodyDesc.dynamic()
+						.setTranslation(object.position.x, object.position.y, object.position.z)
+						.setRotation({ x: object.quaternion.x, y: object.quaternion.y, z: object.quaternion.z, w: object.quaternion.w })
+						.setAngularDamping(0.6)
+						.setCcdEnabled(true),
+				);
+				for (const desc of colliders) world.createCollider(desc.setDensity(density).setFriction(friction).setRestitution(restitution), body);
+				if (asleep) body.sleep();
+				dynamicBodies.push({ body, object });
+				return body;
 			}
 
-			panel.addEventListener("input", ({ target }) => {
-				if (target.type === "checkbox") settings[target.id] = target.checked;
-				else if (target.type === "range") settings[target.id] = parseFloat(target.value);
-				else return; // seed and face apply on "change"
+			addStatic(RAPIER.ColliderDesc.cuboid(100, 0.5, 100), 0, groundY - 0.5, 0);
+			for (const [center, size] of plankBoxes) {
+				addStatic(RAPIER.ColliderDesc.cuboid(size.x / 2, size.y / 2, size.z / 2), center.x + table.position.x, center.y, center.z + table.position.z);
+			}
 
-				if (target.id === "grooves") skinDirty = true;
-				if (["width", "height", "grooves"].includes(target.id)) queueRebuild();
-				applyToggles();
+			// The pumpkin body: a coarse copy of the outer and inner shell joined at
+			// the opening, so the lid can rest on the rim and things can fall in.
+			// (The carved holes are left solid here.)
+			pumpkin.updateMatrixWorld(true);
+			{
+				const cols = 96;
+				const rows = 28;
+				const positions = [];
+				const index = [];
+				const p = new THREE.Vector3();
+				const n = new THREE.Vector3();
+				for (let i = 0; i < cols; i++) {
+					const u = i / cols;
+					const v0 = lidCut(u);
+					for (let j = 0; j <= rows; j++) {
+						const v = v0 + ((1 - v0) * j) / rows;
+						surfacePoint(u, v, p);
+						surfaceNormal(u, v, n);
+						_v.copy(p).applyMatrix4(pumpkin.matrixWorld);
+						positions.push(_v.x, _v.y, _v.z);
+						_v.copy(p).addScaledVector(n, -SHELL).applyMatrix4(pumpkin.matrixWorld);
+						positions.push(_v.x, _v.y, _v.z);
+					}
+				}
+				const id = (i, j, inner) => ((i % cols) * (rows + 1) + j) * 2 + inner;
+				for (let i = 0; i < cols; i++) {
+					for (let j = 0; j < rows; j++) {
+						for (const inner of [0, 1]) index.push(id(i, j, inner), id(i, j + 1, inner), id(i + 1, j, inner), id(i + 1, j, inner), id(i, j + 1, inner), id(i + 1, j + 1, inner));
+					}
+					index.push(id(i, 0, 0), id(i, 0, 1), id(i + 1, 0, 0), id(i + 1, 0, 0), id(i, 0, 1), id(i + 1, 0, 1));
+				}
+				world.createCollider(RAPIER.ColliderDesc.trimesh(new Float32Array(positions), new Uint32Array(index)));
+			}
+
+			// The lid becomes its own body, resting asleep on the opening. Its
+			// shape: a hull of the cap's outer skin, plus one around the stem.
+			const ringCenter = lidRing.reduce((sum, [u, v]) => sum.add(surfacePoint(u, v)), new THREE.Vector3()).divideScalar(lidRing.length);
+			const lidRoot = new THREE.Group();
+			lidRoot.position.copy(ringCenter).applyMatrix4(pumpkin.matrixWorld);
+			lidRoot.quaternion.copy(pumpkin.quaternion);
+			lid.position.copy(ringCenter).negate();
+			lidRoot.add(lid);
+			scene.add(lidRoot);
+			const capPoints = [];
+			for (let i = 0; i < 48; i++) {
+				for (let j = 0; j <= 6; j++) {
+					const u = i / 48;
+					// A convex hull would fill in the zig-zag and swallow the body's
+					// teeth, so stop at the tips of the teeth: it rests on them.
+					const tips = lidV - 0.015 + 0.012 * Math.sin(TAU * u + lidTilt) - 0.004;
+					// Slightly wider than the lid, so it catches the outer lip of the cut
+					// instead of sliding down the sloping cut face.
+					surfacePoint(u, (tips * j) / 6, _v).sub(ringCenter);
+					capPoints.push(_v.x * 1.07, _v.y, _v.z * 1.07);
+				}
+			}
+			const lidBody = addDynamic(lidRoot, [RAPIER.ColliderDesc.convexHull(new Float32Array(capPoints)), RAPIER.ColliderDesc.convexHull(pointsIn(stem, lidRoot, 5))], {
+				density: 0.6,
+				asleep: true,
 			});
 
-			ui.seed.addEventListener("change", () => {
-				const seed = parseInt(ui.seed.value);
-				if (seed > 0) newPumpkin(seed);
-				else ui.seed.value = settings.seed;
-			});
+			// =====================================================================
+			// Props: shared helpers
+			// =====================================================================
 
-			ui.face.addEventListener("change", () => {
-				settings.face = ui.face.value;
-				saveToURL();
-				buildPumpkin();
-			});
+			// Move every vertex of a geometry: fn(x, y, z) returns [x, y, z].
+			function displace(geometry, fn) {
+				const position = geometry.attributes.position;
+				for (let i = 0; i < position.count; i++) {
+					const [x, y, z] = fn(position.getX(i), position.getY(i), position.getZ(i));
+					position.setXYZ(i, x, y, z);
+				}
+				geometry.computeVertexNormals();
+				return geometry;
+			}
 
-			ui.newPumpkin.addEventListener("click", () => newPumpkin(randomSeed()));
+			const lathe = (profile, segments = 48) => new THREE.LatheGeometry(profile.map(([r, y]) => new THREE.Vector2(r, y)), segments);
+			const bump = (p, cx, cy, cz, size) => Math.exp(-((p.x - cx) ** 2 + (p.y - cy) ** 2 + (p.z - cz) ** 2) / (size * size));
 
-			// Render a fresh frame and save it straight away, before the browser
-			// clears the canvas.
-			ui.screenshot.addEventListener("click", () => {
-				renderer.render(scene, camera);
-				renderer.domElement.toBlob((blob) => {
-					const link = document.createElement("a");
-					link.href = URL.createObjectURL(blob);
-					link.download = `pumpkin-${settings.seed}-${settings.face}.png`;
-					link.click();
-					setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+			function shadowed(object) {
+				object.traverse((child) => {
+					if (child.isMesh) child.castShadow = child.receiveShadow = true;
 				});
+				return object;
+			}
+
+			// Something you can grab (it has a body) and/or click.
+			const interactives = []; // { object, body?, onClick? }
+			const clickTarget = (radius) => new THREE.Mesh(new THREE.SphereGeometry(radius, 8, 6), new THREE.MeshBasicMaterial({ visible: false }));
+
+			// =====================================================================
+			// Flames
+			// Each flame can be clicked out. Once out it stays out and its wick
+			// keeps giving off a thin thread of smoke.
+			// =====================================================================
+
+			const flames = []; // { mesh, material, on, lit, wax? }
+			const pumpkinFlame = { mesh: flame, material: flameMaterial, on: true, lit: 1 };
+			flames.push(pumpkinFlame);
+
+			function addFlame(parent, position, width, height, wax) {
+				const material = flameMaterial.clone();
+				material.uniforms.uPhase.value = random(0, 50);
+				const geometry = new THREE.PlaneGeometry(width, height);
+				geometry.translate(0, height / 2, 0);
+				const mesh = new THREE.Mesh(geometry, material);
+				mesh.position.copy(position);
+				parent.add(mesh);
+				const entry = { mesh, material, on: true, lit: 1, wax };
+				flames.push(entry);
+				const target = clickTarget(width * 1.3);
+				target.position.copy(position).y += height * 0.4;
+				parent.add(target);
+				interactives.push({ object: target, onClick: () => putOut(entry) });
+				return entry;
+			}
+
+			function putOut(entry) {
+				if (!entry.on) return;
+				entry.on = false;
+				if (entry === pumpkinFlame) settings.candleLit = false;
+				smokeEmitters.push({ flame: entry, age: 0, carry: 0 });
+			}
+
+			const pumpkinFlameTarget = clickTarget(0.06);
+			pumpkinFlameTarget.position.copy(flame.position).y += 0.05;
+			flame.parent.add(pumpkinFlameTarget);
+			interactives.push({ object: pumpkinFlameTarget, onClick: () => putOut(pumpkinFlame) });
+
+			// =====================================================================
+			// Tall dripping candles (back left)
+			// =====================================================================
+
+			// Wax that glows from within near its flame: a per-vertex glow amount
+			// feeds the emissive color, scaled by how lit the candle is.
+			function glowingWax(color) {
+				const material = new THREE.MeshStandardMaterial({ color, roughness: 0.55 });
+				const level = { value: 1 };
+				material.userData.level = level;
+				material.onBeforeCompile = (shader) => {
+					shader.uniforms.uGlowLevel = level;
+					shader.vertexShader = shader.vertexShader
+						.replace("#include <common>", "#include <common>\nattribute float aGlow;\nvarying float vGlow;")
+						.replace("#include <begin_vertex>", "#include <begin_vertex>\nvGlow = aGlow;");
+					shader.fragmentShader = shader.fragmentShader
+						.replace("#include <common>", "#include <common>\nuniform float uGlowLevel;\nvarying float vGlow;")
+						.replace("#include <emissivemap_fragment>", "#include <emissivemap_fragment>\ntotalEmissiveRadiance += vec3(1.0, 0.5, 0.18) * vGlow * vGlow * uGlowLevel * 0.8;");
+				};
+				return material;
+			}
+
+			// A pillar candle: uneven body, a lumpy lip around a melted crater,
+			// heavy drips (most short, a few running nearly to the foot, each with
+			// a bead at the end) and a puddle of wax around the base.
+			function buildPillar(radius, height) {
+				const phase = random(0, 100);
+				const parts = [];
+
+				parts.push(
+					displace(new THREE.CylinderGeometry(radius, radius * 1.03, height, 40, 24, true).translate(0, height / 2, 0), (x, y, z) => {
+						const a = Math.atan2(z, x);
+						const k = 1 + 0.05 * (woodNoise(a * 2 + phase, y * 2) - 0.5) + 0.02 * Math.sin(a * 3 + phase);
+						return [x * k, y, z * k];
+					}),
+				);
+
+				parts.push(
+					displace(
+						lathe([
+							[radius, height - 0.02],
+							[radius * 1.05, height + 0.03],
+							[radius * 0.93, height + 0.05],
+							[radius * 0.7, height - 0.02],
+							[radius * 0.3, height - 0.06],
+							[0.001, height - 0.07],
+						]),
+						(x, y, z) => {
+							const a = Math.atan2(z, x);
+							const lip = smoothstep(radius * 0.6, radius, Math.hypot(x, z));
+							return [x, y + lip * 0.05 * (woodNoise(a * 3 + phase, 7) - 0.5), z];
+						},
+					),
+				);
+
+				for (let i = 0, count = randInt(24, 38); i < count; i++) {
+					const a = random(0, TAU);
+					const length = height * Math.min(0.9, Math.pow(rand(), 1.8) * 0.85 + 0.04);
+					const r = random(0.014, 0.034);
+					const top = height + random(-0.01, 0.035);
+					const points = Array.from({ length: 7 }, (_, k) => {
+						const t = k / 6;
+						const aa = a + 0.05 * Math.sin(t * 3 + i);
+						const rr = radius + r * 0.35 + 0.012 * (1 - t);
+						return new THREE.Vector3(Math.cos(aa) * rr, top - length * t, Math.sin(aa) * rr);
+					});
+					parts.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 10, r, 6, false));
+					const end = points[6];
+					parts.push(new THREE.SphereGeometry(r * 1.4, 8, 6).scale(1, 1.3, 1).translate(end.x, end.y, end.z));
+				}
+
+				parts.push(
+					lathe([
+						[radius * 1.5, 0],
+						[radius * 1.35, 0.03],
+						[radius * 1.08, 0.05],
+						[radius * 0.98, 0.07],
+					]),
+				);
+
+				for (const part of parts) {
+					const position = part.attributes.position;
+					const glowAmount = new Float32Array(position.count);
+					for (let i = 0; i < position.count; i++) glowAmount[i] = smoothstep(height - 0.9, height + 0.05, position.getY(i));
+					part.setAttribute("aGlow", new THREE.BufferAttribute(glowAmount, 1));
+				}
+				return mergeGeometries(parts);
+			}
+
+			rand = mulberry32(77);
+			const candleCluster = new THREE.Group();
+			const clusterFlames = [];
+			for (const [x, z, radius, height] of [
+				[-1.45, -0.88, 0.27, 2.1],
+				[-0.88, -1.05, 0.3, 1.6],
+				[-1.78, -0.42, 0.24, 1.15],
+				[-1.3, -0.25, 0.26, 0.7],
+			]) {
+				const wax = glowingWax(new THREE.Color("#e6d9c0").offsetHSL(random(-0.01, 0.01), random(-0.05, 0.05), random(-0.04, 0.03)));
+				const candle = new THREE.Mesh(buildPillar(radius, height), wax);
+				candle.position.set(x, 0, z);
+				candle.rotation.y = random(0, TAU);
+				candleCluster.add(candle);
+				const wickTop = new THREE.Vector3(x, height - 0.03, z);
+				const wick = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.07, 6), new THREE.MeshStandardMaterial({ color: "#1b130d" }));
+				wick.position.copy(wickTop).y -= 0.03;
+				wick.rotation.z = random(-0.2, 0.2);
+				candleCluster.add(wick);
+				clusterFlames.push(addFlame(candleCluster, wickTop, 0.075, 0.22, wax));
+				addStatic(RAPIER.ColliderDesc.cylinder(height / 2, radius * 1.05), x, height / 2, z);
+			}
+			scene.add(shadowed(candleCluster));
+
+			const CLUSTER_INTENSITY = 3.2;
+			const clusterLight = new THREE.PointLight("#ffa04a", CLUSTER_INTENSITY, 0, 1.4);
+			clusterLight.position.set(-1.3, 2.0, -0.6);
+			clusterLight.castShadow = true;
+			clusterLight.shadow.mapSize.set(512, 512);
+			clusterLight.shadow.camera.near = 0.1;
+			clusterLight.shadow.bias = -0.004;
+			scene.add(clusterLight);
+
+			// =====================================================================
+			// Skull (right). Click it and its jaw chatters.
+			// =====================================================================
+
+			function buildSkull() {
+				const geometry = new THREE.SphereGeometry(1, 96, 72);
+				const position = geometry.attributes.position;
+				const colors = [];
+				const bone = new THREE.Color("#c9b994");
+				const dirt = new THREE.Color("#6e5a3c");
+				const dark = new THREE.Color("#1e1712");
+				const color = new THREE.Color();
+				const p = new THREE.Vector3();
+
+				for (let i = 0; i < position.count; i++) {
+					p.fromBufferAttribute(position, i); // unit sphere, +z is the face
+					let x = p.x * 0.8;
+					let y = p.y * 0.88;
+					let z = p.z;
+					const face = smoothstep(0.15, 0.75, p.z) * smoothstep(0.25, -0.35, p.y);
+					const low = smoothstep(-0.3, -0.9, p.y);
+					x *= 1 - 0.22 * face - 0.3 * low;
+					z = z * (1 - 0.3 * low) + 0.12 * low * smoothstep(-0.2, 0.6, p.z);
+					y += 0.12 * low * smoothstep(0.5, -0.5, p.z);
+
+					// Deep orbits with sharp upper rims, a nasal hole, cheekbones that
+					// stand out, sunken temples, and a heavy brow.
+					const sockets = bump(p, 0.33, -0.04, 0.9, 0.2) + bump(p, -0.33, -0.04, 0.9, 0.2);
+					const nose = bump(p, 0, -0.33, 0.94, 0.11) * smoothstep(-0.55, -0.22, p.y) + 0.6 * bump(p, 0, -0.42, 0.9, 0.08);
+					const cheeks = bump(p, 0.52, -0.3, 0.7, 0.14) + bump(p, -0.52, -0.3, 0.7, 0.14);
+					const arches = bump(p, 0.78, -0.22, 0.35, 0.16) + bump(p, -0.78, -0.22, 0.35, 0.16);
+					const temples = bump(p, 0.8, 0.12, 0.35, 0.22) + bump(p, -0.8, 0.12, 0.35, 0.22);
+					const brow = bump(p, 0.3, 0.17, 0.93, 0.1) + bump(p, -0.3, 0.17, 0.93, 0.1) + 0.6 * bump(p, 0, 0.16, 0.98, 0.12);
+					const underCheek = bump(p, 0.45, -0.52, 0.55, 0.16) + bump(p, -0.45, -0.52, 0.55, 0.16);
+					const k = 1 - 0.55 * sockets - 0.4 * nose + 0.09 * cheeks + 0.06 * arches - 0.1 * temples + 0.07 * brow - 0.08 * underCheek;
+					position.setXYZ(i, x * k, y * k, z * k);
+
+					const cavity = clamp(sockets * 1.5 + nose * 1.8 + underCheek * 0.4 + temples * 0.25, 0, 1);
+					color
+						.copy(bone)
+						.lerp(dirt, 0.45 * woodNoise(p.x * 6 + 900, p.y * 6 + p.z * 4) + 0.25 * low + 0.2 * (1 - p.y) * 0.5)
+						.lerp(dark, cavity * cavity);
+					colors.push(color.r, color.g, color.b);
+				}
+				geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+				geometry.computeVertexNormals();
+
+				const boneMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8 });
+				const toothMaterial = new THREE.MeshStandardMaterial({ color: "#cbbb92", roughness: 0.55 });
+				const skull = new THREE.Group();
+				skull.add(new THREE.Mesh(geometry, boneMaterial));
+
+				const tooth = new THREE.BoxGeometry(0.06, 0.11, 0.05);
+				const teeth = (parent, y, radius, depth, flip) => {
+					for (let i = 0; i < 10; i++) {
+						const a = (i / 9 - 0.5) * 2.2;
+						const t = new THREE.Mesh(tooth, toothMaterial);
+						t.position.set(Math.sin(a) * radius, y + random(-0.01, 0.01), depth + Math.cos(a) * radius * 0.9);
+						t.rotation.y = a;
+						t.scale.y = flip * random(0.8, 1.1);
+						parent.add(t);
+					}
+				};
+				teeth(skull, -0.66, 0.27, 0.38, 1);
+
+				// The jaw hinges just under the ears: a U-shaped plate under the
+				// lower teeth, with a branch rising to each hinge.
+				const jaw = new THREE.Group();
+				jaw.position.set(0, -0.45, 0.02);
+				const jawShape = new THREE.Shape(); // in x/z, chin toward +z
+				jawShape.moveTo(-0.42, 0.02);
+				jawShape.quadraticCurveTo(-0.42, 0.62, 0, 0.64);
+				jawShape.quadraticCurveTo(0.42, 0.62, 0.42, 0.02);
+				jawShape.lineTo(0.3, 0.04);
+				jawShape.quadraticCurveTo(0.3, 0.5, 0, 0.5);
+				jawShape.quadraticCurveTo(-0.3, 0.5, -0.3, 0.04);
+				jawShape.closePath();
+				const plate = new THREE.ExtrudeGeometry(jawShape, { depth: 0.12, bevelEnabled: true, bevelThickness: 0.03, bevelSize: 0.025, bevelSegments: 2, curveSegments: 16 });
+				plate.rotateX(Math.PI / 2).translate(0, -0.3, 0);
+				jaw.add(new THREE.Mesh(plate, toothMaterial));
+				for (const side of [-1, 1]) {
+					const branch = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.36, 0.15), toothMaterial);
+					branch.position.set(side * 0.37, -0.15, 0.06);
+					branch.rotation.x = -0.15;
+					jaw.add(branch);
+				}
+				teeth(jaw, -0.28, 0.24, 0.3, -1);
+				skull.add(jaw);
+				skull.userData.jaw = jaw;
+				return skull;
+			}
+
+			const skull = buildSkull();
+			skull.scale.setScalar(0.45);
+			skull.position.set(1.52, 0.47, 0.45);
+			skull.rotation.set(0.05, -0.55, 0);
+			scene.add(shadowed(skull));
+			let jawChatter = 0;
+			interactives.push({
+				object: skull,
+				body: addDynamic(skull, [hull(skull, 9)], { density: 1.2, asleep: true }),
+				onClick: () => (jawChatter = 1.4),
 			});
+
+			// =====================================================================
+			// Apple (front left)
+			// =====================================================================
+
+			function buildApple() {
+				const geometry = displace(new THREE.SphereGeometry(1, 48, 32), (x, y, z) => {
+					const fromTop = Math.acos(clamp(y, -1, 1));
+					let r = 1 - 0.24 * Math.exp(-((fromTop / 0.38) ** 2)) - 0.12 * Math.exp(-(((Math.PI - fromTop) / 0.35) ** 2));
+					r *= 1 + 0.07 * y + 0.02 * Math.sin(5 * Math.atan2(z, x)) * Math.sin(fromTop);
+					return [x * r, y * r * 0.9, z * r];
+				});
+				const [[canvas, ctx]] = paintCanvases(512, 256, 1, (px, py, out) => {
+					const u = px / 512;
+					const v = py / 256;
+					const streak = woodNoise(u * 60 + 1200, v * 4, 60);
+					const blush = smoothstep(0.35, 0.75, woodNoise(u * 4 + 1300, v * 3, 4) + 0.3 * v);
+					out[0][0] = 150 + 50 * streak - 10 * blush + 40 * (1 - blush);
+					out[0][1] = 22 + 20 * streak + 110 * (1 - blush) * 0.6;
+					out[0][2] = 22 + 10 * streak;
+				});
+				for (let i = 0; i < 500; i++) {
+					ctx.fillStyle = `rgba(240, 220, 150, ${random(0.2, 0.5)})`;
+					ctx.fillRect(random(0, 512), random(0, 256), 1.2, 1.2);
+				}
+				const apple = new THREE.Group();
+				apple.add(new THREE.Mesh(geometry, new THREE.MeshPhysicalMaterial({ map: colorTexture(canvas), roughness: 0.35, clearcoat: 0.4 })));
+				const stalk = new THREE.Mesh(
+					new THREE.TubeGeometry(new THREE.QuadraticBezierCurve3(new THREE.Vector3(0, 0.6, 0), new THREE.Vector3(0.02, 0.95, 0), new THREE.Vector3(0.12, 1.15, 0)), 8, 0.035, 6),
+					new THREE.MeshStandardMaterial({ color: "#4a3420", roughness: 0.9 }),
+				);
+				apple.add(stalk);
+				return apple;
+			}
+
+			const apple = buildApple();
+			apple.scale.setScalar(0.22);
+			apple.position.set(-0.52, 0.2, 1.25);
+			apple.rotation.set(0.3, 0.8, 0.2);
+			scene.add(shadowed(apple));
+			interactives.push({ object: apple, body: addDynamic(apple, [RAPIER.ColliderDesc.ball(0.205)], { restitution: 0.3, density: 0.8 }) });
+
+			// =====================================================================
+			// Wine bottle (behind the pumpkin's right shoulder) and a glass of wine
+			// =====================================================================
+
+			function labelTexture() {
+				const [canvas, ctx] = makeCanvas(512, 256);
+				ctx.fillStyle = "#d9c9a3";
+				ctx.fillRect(0, 0, 512, 256);
+				ctx.filter = "blur(10px)";
+				for (let i = 0; i < 14; i++) {
+					ctx.fillStyle = `rgba(110, 80, 40, ${random(0.05, 0.2)})`;
+					ctx.beginPath();
+					ctx.ellipse(random(0, 512), random(0, 256), random(20, 90), random(15, 60), 0, 0, TAU);
+					ctx.fill();
+				}
+				ctx.filter = "none";
+				ctx.strokeStyle = "rgba(60, 30, 20, 0.7)";
+				ctx.lineWidth = 3;
+				ctx.strokeRect(22, 22, 468, 212);
+				ctx.fillStyle = "rgba(55, 20, 18, 0.85)";
+				ctx.textAlign = "center";
+				ctx.font = "italic 54px Georgia, serif";
+				ctx.fillText("Sang Noir", 256, 120);
+				ctx.font = "26px Georgia, serif";
+				ctx.fillText("~ 1871 ~", 256, 175);
+				return colorTexture(canvas);
+			}
+
+			const bottle = new THREE.Group();
+			const glassDark = new THREE.MeshPhysicalMaterial({ color: "#0d1a0d", roughness: 0.06, clearcoat: 1, clearcoatRoughness: 0.05 });
+			bottle.add(
+				new THREE.Mesh(
+					lathe([
+						[0.001, 0.03],
+						[0.2, 0],
+						[0.25, 0.03],
+						[0.25, 1.1],
+						[0.22, 1.28],
+						[0.12, 1.48],
+						[0.09, 1.62],
+						[0.09, 1.9],
+						[0.1, 1.92],
+						[0.001, 1.93],
+					]),
+					glassDark,
+				),
+			);
+			const label = new THREE.Mesh(
+				new THREE.CylinderGeometry(0.253, 0.253, 0.5, 48, 1, true, -0.95, 1.9),
+				new THREE.MeshStandardMaterial({ map: labelTexture(), roughness: 0.9 }),
+			);
+			label.position.y = 0.6;
+			bottle.add(label);
+			// A red wax seal, dripping down the neck.
+			const sealWax = new THREE.MeshPhysicalMaterial({ color: "#5a0d0d", roughness: 0.35, clearcoat: 0.5 });
+			bottle.add(new THREE.Mesh(lathe([[0.105, 1.62], [0.11, 1.95], [0.001, 1.97]], 24), sealWax));
+			for (let i = 0; i < 6; i++) {
+				const a = random(0, TAU);
+				const length = random(0.06, 0.25);
+				const drip = new THREE.Mesh(new THREE.CapsuleGeometry(0.018, length, 4, 8), sealWax);
+				drip.position.set(Math.cos(a) * 0.1, 1.62 - length / 2 + 0.02, Math.sin(a) * 0.1);
+				bottle.add(drip);
+			}
+			bottle.position.set(0.82, 0, -1.02);
+			bottle.rotation.y = 0.4;
+			scene.add(shadowed(bottle));
+			addStatic(RAPIER.ColliderDesc.cylinder(0.95, 0.25), 0.82, 0.95, -1.02);
+
+			function buildWineGlass() {
+				const glass = new THREE.Group();
+				glass.add(
+					new THREE.Mesh(
+						lathe(
+							[
+								[0.15, 0],
+								[0.16, 0.012],
+								[0.03, 0.03],
+								[0.018, 0.08],
+								[0.018, 0.4],
+								[0.05, 0.47],
+								[0.15, 0.62],
+								[0.17, 0.78],
+								[0.15, 0.95],
+							],
+							40,
+						),
+						new THREE.MeshPhysicalMaterial({
+							color: "#ffffff",
+							transparent: true,
+							opacity: 0.2,
+							roughness: 0.05,
+							clearcoat: 1,
+							side: THREE.DoubleSide,
+							depthWrite: false,
+						}),
+					),
+				);
+				const wine = new THREE.Mesh(
+					lathe(
+						[
+							[0.001, 0.49],
+							[0.045, 0.49],
+							[0.14, 0.62],
+							[0.155, 0.7],
+							[0.001, 0.7],
+						],
+						40,
+					),
+					new THREE.MeshPhysicalMaterial({ color: "#3a0610", roughness: 0.1, clearcoat: 1, transparent: true, opacity: 0.92 }),
+				);
+				wine.userData.noCollide = true;
+				glass.add(wine);
+				return glass;
+			}
+
+			const wineGlass = buildWineGlass();
+			wineGlass.position.set(-1.08, 0.005, 1.28);
+			scene.add(wineGlass);
+			wineGlass.children[0].castShadow = true;
+			interactives.push({ object: wineGlass, body: addDynamic(wineGlass, [hull(wineGlass, 3)], { density: 0.8 }) });
+
+			// =====================================================================
+			// The doll (back right). Her head slowly follows you. Click her and
+			// she blinks.
+			// =====================================================================
+
+			function porcelainTexture() {
+				const [[canvas, ctx]] = paintCanvases(512, 256, 1, (x, y, out) => {
+					const grime = woodNoise(x * 0.03 + 2000, y * 0.03) * 0.5 + smoothstep(0.4, 1, y / 256) * 0.3;
+					out[0][0] = 238 - 40 * grime;
+					out[0][1] = 225 - 45 * grime;
+					out[0][2] = 208 - 50 * grime;
+				});
+				// Faded rosy cheeks and lips (the face is at u = 0.25 on a sphere).
+				ctx.filter = "blur(8px)";
+				ctx.fillStyle = "rgba(205, 110, 105, 0.35)";
+				for (const dx of [-38, 38]) {
+					ctx.beginPath();
+					ctx.ellipse(128 + dx, 150, 22, 16, 0, 0, TAU);
+					ctx.fill();
+				}
+				ctx.filter = "blur(1.5px)";
+				ctx.fillStyle = "rgba(150, 40, 45, 0.75)";
+				ctx.beginPath();
+				ctx.ellipse(128, 170, 13, 5, 0, 0, TAU);
+				ctx.fill();
+				ctx.strokeStyle = "rgba(95, 70, 50, 0.55)";
+				ctx.lineWidth = 2;
+				for (const dx of [-30, 30]) {
+					ctx.beginPath();
+					ctx.arc(128 + dx, 120, 18, Math.PI * 1.2, Math.PI * 1.8);
+					ctx.stroke();
+				}
+				ctx.filter = "none";
+				// Cracks: one long one across the face, a few hairlines.
+				ctx.strokeStyle = "rgba(40, 30, 25, 0.85)";
+				for (let c = 0; c < 6; c++) {
+					let x = c === 0 ? 100 : random(10, 250);
+					let y = c === 0 ? 40 : random(30, 220);
+					ctx.lineWidth = c === 0 ? 1.8 : 1;
+					ctx.beginPath();
+					ctx.moveTo(x, y);
+					for (let s = 0, n = c === 0 ? 30 : randInt(6, 14); s < n; s++) {
+						x += random(-6, 8);
+						y += random(1, 7);
+						ctx.lineTo(x, y);
+					}
+					ctx.stroke();
+				}
+				return colorTexture(canvas);
+			}
+
+			function eyeTexture() {
+				const [canvas, ctx] = makeCanvas(256, 128);
+				ctx.fillStyle = "#e6dcc4";
+				ctx.fillRect(0, 0, 256, 128);
+				// Iris and pupil at the front of the sphere (u = 0.25).
+				const gradient = ctx.createRadialGradient(64, 64, 3, 64, 64, 20);
+				gradient.addColorStop(0, "#111");
+				gradient.addColorStop(0.35, "#111");
+				gradient.addColorStop(0.4, "#5f7c86");
+				gradient.addColorStop(0.95, "#33474f");
+				gradient.addColorStop(1, "rgba(40, 50, 55, 0)");
+				ctx.fillStyle = gradient;
+				ctx.beginPath();
+				ctx.ellipse(64, 64, 20, 24, 0, 0, TAU);
+				ctx.fill();
+				return colorTexture(canvas);
+			}
+
+			function buildDoll() {
+				rand = mulberry32(666);
+				const doll = new THREE.Group();
+				const porcelain = new THREE.MeshPhysicalMaterial({ map: porcelainTexture(), roughness: 0.35, clearcoat: 0.6 });
+				const limbPorcelain = new THREE.MeshPhysicalMaterial({ color: "#d9cbb6", roughness: 0.4, clearcoat: 0.5 });
+				const [[laceCanvas, laceCtx]] = paintCanvases(256, 256, 1, (x, y, out) => {
+					const n = woodNoise(x * 0.05 + 3000, y * 0.05);
+					out[0][0] = 205 - 45 * n;
+					out[0][1] = 195 - 50 * n;
+					out[0][2] = 172 - 55 * n;
+				});
+				laceCtx.fillStyle = "rgba(90, 75, 55, 0.35)";
+				for (let y = 6; y < 256; y += 12) for (let x = (y / 12) % 2 ? 6 : 12; x < 256; x += 12) laceCtx.fillRect(x, y, 3, 3);
+				const lace = colorTexture(laceCanvas);
+				lace.wrapS = lace.wrapT = THREE.RepeatWrapping;
+				lace.repeat.set(3, 3);
+				const cloth = new THREE.MeshStandardMaterial({ map: lace, roughness: 0.95, side: THREE.DoubleSide });
+
+				// Seated body: dress with a ruffled hem, legs out in front.
+				const skirt = displace(
+					lathe([
+						[0.1, 0.62],
+						[0.2, 0.5],
+						[0.3, 0.2],
+						[0.36, 0.05],
+						[0.38, 0.02],
+					]),
+					(x, y, z) => {
+						const k = 1 + 0.06 * Math.sin(18 * Math.atan2(z, x)) * smoothstep(0.3, 0.02, y);
+						return [x * k, y, z * k];
+					},
+				);
+				doll.add(new THREE.Mesh(skirt, cloth));
+				const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 0.16, 6, 16), cloth);
+				torso.position.y = 0.66;
+				doll.add(torso);
+				for (const side of [-1, 1]) {
+					const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.045, 0.26, 4, 10), cloth);
+					arm.position.set(side * 0.19, 0.55, 0.06);
+					arm.rotation.set(0.5, 0, side * 0.25);
+					const hand = new THREE.Mesh(new THREE.SphereGeometry(0.05, 12, 8), limbPorcelain);
+					hand.position.set(side * 0.23, 0.38, 0.17);
+					const leg = new THREE.Mesh(new THREE.CapsuleGeometry(0.06, 0.3, 4, 10), limbPorcelain);
+					leg.position.set(side * 0.11, 0.08, 0.3);
+					leg.rotation.set(Math.PI / 2 - 0.15, side * 0.12, 0);
+					const shoe = new THREE.Mesh(new THREE.SphereGeometry(0.075, 12, 8).scale(1, 0.8, 1.3), new THREE.MeshStandardMaterial({ color: "#1c1714", roughness: 0.6 }));
+					shoe.position.set(side * 0.13, 0.08, 0.52);
+					doll.add(arm, hand, leg, shoe);
+				}
+
+				// Head on a neck pivot, so it can turn.
+				const head = new THREE.Group();
+				head.position.y = 0.8;
+				const skullShape = displace(new THREE.SphereGeometry(1, 64, 48), (x, y, z) => {
+					const p = { x, y, z };
+					const k = 1 + 0.09 * (bump(p, 0.45, -0.3, 0.7, 0.3) + bump(p, -0.45, -0.3, 0.7, 0.3)) + 0.05 * bump(p, 0, -0.12, 0.98, 0.12) - 0.06 * (bump(p, 0.3, 0.05, 0.92, 0.16) + bump(p, -0.3, 0.05, 0.92, 0.16));
+					return [x * k * 0.92, y * k * (y > 0 ? 1.04 : 0.95), z * k];
+				});
+				const face = new THREE.Mesh(skullShape, porcelain);
+				face.scale.setScalar(0.3);
+				face.position.y = 0.26;
+				head.add(face);
+				const eyes = [];
+				const eyeMaterial = new THREE.MeshPhysicalMaterial({ map: eyeTexture(), roughness: 0.1, clearcoat: 1 });
+				for (const side of [-1, 1]) {
+					const eye = new THREE.Mesh(new THREE.SphereGeometry(0.048, 24, 16), eyeMaterial);
+					eye.position.set(side * 0.1, 0.275, 0.225);
+					eye.rotation.y = side === 1 ? 0.25 : 0; // one eye wanders
+					// Upper lid: a porcelain cap that drops over the eye to blink.
+					const lidCap = new THREE.Mesh(new THREE.SphereGeometry(0.052, 20, 10, 0, TAU, 0, Math.PI / 2), limbPorcelain);
+					lidCap.position.copy(eye.position);
+					lidCap.rotation.x = side === 1 ? -0.9 : -1.25; // one droops
+					head.add(eye, lidCap);
+					eyes.push(lidCap);
+				}
+				// A few stringy strands of hair left on the scalp.
+				const hairMaterial = new THREE.MeshStandardMaterial({ color: "#6b5634", roughness: 0.8 });
+				for (let i = 0; i < 26; i++) {
+					const a = random(-2.4, 2.4);
+					const startPoint = new THREE.Vector3(Math.sin(a) * 0.2, 0.5, Math.cos(a) * 0.2 - 0.05);
+					const fall = random(0.15, 0.32);
+					const points = [startPoint, startPoint.clone().add(new THREE.Vector3(Math.sin(a) * 0.12, -fall * 0.4, Math.cos(a) * 0.1)), startPoint.clone().add(new THREE.Vector3(Math.sin(a) * 0.16 + random(-0.03, 0.03), -fall, Math.cos(a) * 0.12))];
+					head.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 8, 0.004, 4), hairMaterial));
+				}
+				// A yellowed lace bonnet around the back of the head, ruffled at the brim.
+				const bonnet = new THREE.Mesh(
+					displace(new THREE.SphereGeometry(0.34, 32, 16, Math.PI * 0.95, Math.PI * 1.1, 0, Math.PI * 0.72), (x, y, z) => {
+						const k = 1 + 0.04 * Math.sin(Math.atan2(y, x) * 22) * smoothstep(-0.1, 0.25, z);
+						return [x * k, y * k, z];
+					}),
+					cloth,
+				);
+				bonnet.position.set(0, 0.27, -0.03);
+				head.add(bonnet);
+				doll.add(head);
+				doll.userData = { head, eyes, blink: 0 };
+				return doll;
+			}
+
+			const doll = buildDoll();
+			doll.position.set(1.55, 0.005, -0.72);
+			doll.rotation.set(-0.06, -0.45, 0.08); // slumped, turned toward the pumpkin
+			scene.add(shadowed(doll));
+			addStatic(RAPIER.ColliderDesc.cuboid(0.3, 0.55, 0.35), 1.55, 0.55, -0.6);
+			interactives.push({ object: doll, onClick: () => (doll.userData.blink = 1) });
+
+			// =====================================================================
+			// Candy (front)
+			// =====================================================================
+
+			function buildCandyCorn() {
+				const geometry = new THREE.ConeGeometry(0.06, 0.16, 16, 6).scale(1, 1, 0.55);
+				const colors = [];
+				const position = geometry.attributes.position;
+				const yellow = new THREE.Color("#f2ad1d");
+				const orange = new THREE.Color("#ec6614");
+				const white = new THREE.Color("#f3ede0");
+				for (let i = 0; i < position.count; i++) {
+					const y = position.getY(i) / 0.16 + 0.5;
+					const c = y < 0.38 ? yellow : y < 0.72 ? orange : white;
+					colors.push(c.r, c.g, c.b);
+				}
+				geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+				return new THREE.Mesh(geometry, new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.4, clearcoat: 0.3 }));
+			}
+
+			function buildWrappedCandy(color) {
+				const candy = new THREE.Group();
+				const wrapper = new THREE.MeshPhysicalMaterial({ color, roughness: 0.25, clearcoat: 1, metalness: 0.2 });
+				candy.add(new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12).scale(0.08, 0.05, 0.05), wrapper));
+				for (const side of [-1, 1]) {
+					const twist = new THREE.Mesh(new THREE.ConeGeometry(0.045, 0.07, 8, 1, true), wrapper);
+					twist.rotation.z = (side * Math.PI) / 2;
+					twist.position.x = side * 0.1;
+					candy.add(twist);
+				}
+				return candy;
+			}
+
+			rand = mulberry32(31);
+			for (const [make, x, z] of [
+				[buildCandyCorn, 0.62, 1.22],
+				[buildCandyCorn, 0.9, 1.36],
+				[() => buildWrappedCandy("#e8661a"), 1.12, 1.15],
+				[() => buildWrappedCandy("#3a1d4a"), -0.12, 1.36],
+				[buildCandyCorn, -0.82, 1.42],
+			]) {
+				const candy = make();
+				candy.position.set(x, 0.06, z);
+				candy.rotation.set(random(-0.3, 0.3) + Math.PI / 2, random(0, TAU), random(-0.3, 0.3));
+				scene.add(shadowed(candy));
+				interactives.push({ object: candy, body: addDynamic(candy, [hull(candy)], { density: 1.1, friction: 0.7 }) });
+			}
+
+			// =====================================================================
+			// Jar of eyeballs (left). They watch you. Drag the lid off to pick them out.
+			// =====================================================================
+
+			const jar = new THREE.Group();
+			const JAR_TOP = 0.76;
+			jar.add(
+				new THREE.Mesh(
+					lathe(
+						[
+							[0.001, 0],
+							[0.24, 0],
+							[0.27, 0.04],
+							[0.28, 0.55],
+							[0.24, 0.66],
+							[0.235, 0.7],
+							[0.24, 0.72],
+							[0.235, JAR_TOP],
+						],
+						40,
+					),
+					new THREE.MeshPhysicalMaterial({
+						color: "#c8d6c8",
+						transparent: true,
+						opacity: 0.22,
+						roughness: 0.08,
+						clearcoat: 1,
+						side: THREE.DoubleSide,
+						depthWrite: false,
+					}),
+				),
+			);
+			jar.position.set(-1.62, 0.005, 0.42);
+			scene.add(jar);
+			for (let i = 0; i < 14; i++) {
+				const a = (i / 14) * TAU;
+				addStatic(RAPIER.ColliderDesc.cuboid(0.02, JAR_TOP / 2, 0.07).setRotation(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -a)), -1.62 + Math.cos(a) * 0.27, JAR_TOP / 2, 0.42 + Math.sin(a) * 0.27);
+			}
+
+			const jarLid = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 0.07, 32), new THREE.MeshStandardMaterial({ color: "#6e5f4c", metalness: 0.6, roughness: 0.65 }));
+			jarLid.position.set(-1.62, JAR_TOP + 0.036, 0.42);
+			scene.add(shadowed(jarLid));
+			const jarLidBody = addDynamic(jarLid, [RAPIER.ColliderDesc.cylinder(0.035, 0.26)], { density: 1.5, asleep: true });
+			interactives.push({ object: jarLid, body: jarLidBody });
+
+			// Eyeballs: wet, yellowed whites with red veins creeping toward the iris
+			// (the iris sits at u = 0.25, the front of a sphere).
+			function eyeballTexture([inner, outer]) {
+				const [canvas, ctx] = makeCanvas(256, 128);
+				ctx.fillStyle = "#ece2cf";
+				ctx.fillRect(0, 0, 256, 128);
+				ctx.filter = "blur(10px)";
+				ctx.fillStyle = "rgba(205, 120, 105, 0.45)";
+				ctx.fillRect(140, 0, 104, 128); // pinker toward the back
+				ctx.filter = "none";
+				for (let i = 0; i < 30; i++) {
+					const dir = rand() < 0.5 ? -1 : 1;
+					let x = 192 + random(-50, 50);
+					let y = random(12, 116);
+					const path = [[x, y]];
+					for (let step = 0; step < 14; step++) {
+						x += dir * random(4, 9);
+						y += random(-5, 5);
+						path.push([x, y]);
+						const toIris = Math.min(Math.abs(x - 64), Math.abs(x - 320), Math.abs(x + 192));
+						if (Math.hypot(toIris, y - 64) < 28) break;
+					}
+					ctx.strokeStyle = `rgba(${randInt(150, 205)}, 28, 28, ${random(0.35, 0.8)})`;
+					ctx.lineWidth = random(0.6, 1.6);
+					for (const shift of [-256, 0, 256]) {
+						ctx.beginPath();
+						path.forEach(([px, py]) => ctx.lineTo(px + shift, py));
+						ctx.stroke();
+					}
+				}
+				const iris = ctx.createRadialGradient(64, 64, 0, 64, 64, 23);
+				iris.addColorStop(0, "#050505");
+				iris.addColorStop(0.3, "#050505");
+				iris.addColorStop(0.36, inner);
+				iris.addColorStop(0.85, outer);
+				iris.addColorStop(0.95, "#1d1612");
+				iris.addColorStop(1, "rgba(40, 30, 25, 0)");
+				ctx.fillStyle = iris;
+				ctx.beginPath();
+				ctx.arc(64, 64, 23, 0, TAU);
+				ctx.fill();
+				ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
+				for (let a = 0; a < TAU; a += 0.12) {
+					ctx.beginPath();
+					ctx.moveTo(64 + Math.cos(a) * 8, 64 + Math.sin(a) * 8);
+					ctx.lineTo(64 + Math.cos(a) * 19, 64 + Math.sin(a) * 19);
+					ctx.stroke();
+				}
+				return colorTexture(canvas);
+			}
+
+			rand = mulberry32(13);
+			const eyeMaterials = [
+				["#7a9fb8", "#3e5a6e"],
+				["#7f8f4e", "#4a5530"],
+				["#8a5a32", "#4a2e18"],
+				["#9aa7ad", "#56636b"],
+			].map((iris) => new THREE.MeshPhysicalMaterial({ map: eyeballTexture(iris), roughness: 0.12, clearcoat: 1, clearcoatRoughness: 0.05 }));
+			const nerveMaterial = new THREE.MeshStandardMaterial({ color: "#8c4a46", roughness: 0.5 });
+			const EYE_RADIUS = 0.075;
+			const eyeGeometry = new THREE.SphereGeometry(EYE_RADIUS, 32, 20);
+			const nerveGeometry = new THREE.CylinderGeometry(0.012, 0.02, 0.08, 8).rotateX(Math.PI / 2).translate(0, 0, -EYE_RADIUS - 0.03);
+
+			// Packed in layers: a ring of six around one in the middle.
+			const eyeballs = [];
+			for (let layer = 0, n = 0; layer < 4; layer++) {
+				for (let k = 0; k < 7 && n < 24; k++, n++) {
+					const a = (k / 6) * TAU + layer * 0.5;
+					const r = k === 6 ? 0 : 0.16;
+					const eyeball = new THREE.Group();
+					const look = new THREE.Group(); // turns inside the ball, which itself rolls with physics
+					look.add(new THREE.Mesh(eyeGeometry, eyeMaterials[randInt(0, 3)]), new THREE.Mesh(nerveGeometry, nerveMaterial));
+					look.rotation.set(random(-1.5, 1.5), random(0, TAU), 0);
+					eyeball.add(look);
+					eyeball.position.set(jar.position.x + Math.cos(a) * r + random(-0.01, 0.01), 0.09 + layer * 0.155, jar.position.z + Math.sin(a) * r + random(-0.01, 0.01));
+					scene.add(shadowed(eyeball));
+					const body = addDynamic(eyeball, [RAPIER.ColliderDesc.ball(EYE_RADIUS)], { density: 1.05, friction: 0.4, restitution: 0.25 });
+					interactives.push({ object: eyeball, body });
+					eyeballs.push({ look, watches: rand() < 0.75, rate: random(0.4, 1.2) });
+				}
+			}
+			const eyeAim = new THREE.Object3D();
+
+			// =====================================================================
+			// Cobwebs
+			// =====================================================================
+
+			// A fan web in a corner: spokes from `corner` spread between dirA and
+			// dirB, with sagging spiral threads and a couple of loose strands.
+			function buildCobweb(corner, dirA, dirB, size) {
+				const points = [];
+				const spokes = randInt(7, 10);
+				const rings = randInt(6, 9);
+				const sag = new THREE.Vector3(0, -1, 0);
+				const ends = [];
+				for (let s = 0; s < spokes; s++) {
+					const dir = dirA.clone().lerp(dirB, s / (spokes - 1)).normalize();
+					ends.push({ dir, length: size * random(0.8, 1.1) });
+					points.push(corner.clone(), corner.clone().addScaledVector(dir, ends[s].length));
+				}
+				for (let r = 1; r <= rings; r++) {
+					for (let s = 0; s < spokes - 1; s++) {
+						if (rand() < 0.08) continue; // broken
+						const d = (r / (rings + 1)) * size * random(0.95, 1.05);
+						const a = corner.clone().addScaledVector(ends[s].dir, Math.min(d, ends[s].length));
+						const b = corner.clone().addScaledVector(ends[s + 1].dir, Math.min(d, ends[s + 1].length));
+						const mid = a.clone().lerp(b, 0.5).addScaledVector(sag, 0.02 * d);
+						points.push(a, mid, mid.clone(), b);
+					}
+				}
+				for (let i = 0; i < 3; i++) {
+					const start = corner.clone().addScaledVector(ends[randInt(0, spokes - 1)].dir, size * random(0.3, 0.9));
+					points.push(start, start.clone().add(new THREE.Vector3(random(-0.05, 0.05), -random(0.15, 0.45), random(-0.05, 0.05))));
+				}
+				return new THREE.LineSegments(
+					new THREE.BufferGeometry().setFromPoints(points),
+					new THREE.LineBasicMaterial({ color: "#d4d6da", transparent: true, opacity: 0.3, depthWrite: false }),
+				);
+			}
+
+			// A strand sagging between two points.
+			function strand(a, b, sagAmount) {
+				const points = [];
+				for (let i = 0; i <= 16; i++) {
+					const t = i / 16;
+					points.push(a.clone().lerp(b, t).add(new THREE.Vector3(0, -sagAmount * 4 * t * (1 - t), 0)));
+				}
+				return new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineBasicMaterial({ color: "#d4d6da", transparent: true, opacity: 0.28, depthWrite: false }));
+			}
+
+			rand = mulberry32(404);
+			const tableBack = table.position.z - tableDepth / 2;
+			const tableFront = table.position.z + tableDepth / 2;
+			scene.add(
+				buildCobweb(new THREE.Vector3(-2.0, 0.01, tableBack + 0.02), new THREE.Vector3(0.55, 1, 0.3), new THREE.Vector3(1, 0.05, 0.02), 1.0),
+				buildCobweb(new THREE.Vector3(-1.62, 1.85, -0.72), new THREE.Vector3(-0.2, -0.4, 1), new THREE.Vector3(-0.9, -0.6, 0.6), 0.7),
+				buildCobweb(new THREE.Vector3(legX - 0.02, -0.45, table.position.z + legZ - 0.02), new THREE.Vector3(-1, 0, 0), new THREE.Vector3(0, -1, 0), 0.9),
+				buildCobweb(new THREE.Vector3(2.0, 0.01, tableBack + 0.03), new THREE.Vector3(-0.6, 1, 0.4), new THREE.Vector3(-1, 0.1, 0.05), 0.8),
+				strand(new THREE.Vector3(0.82, 1.7, -1.02), new THREE.Vector3(1.5, 1.05, -0.78), 0.12),
+				strand(new THREE.Vector3(0.84, 1.55, -1.0), new THREE.Vector3(1.62, 0.9, -0.66), 0.08),
+				strand(new THREE.Vector3(-0.88, 1.5, -1.05), new THREE.Vector3(-1.45, 1.95, -0.88), 0.1),
+			);
 
 			// =====================================================================
 			// Smoke
-			// A short wisp from the wick when the candle goes out. It rises through
-			// the pumpkin, so it shows through the carving and out of the top.
+			// One draw call for every wisp: particles carry their own size and fade.
+			// A wick that's just gone out puffs for a couple of seconds, then keeps
+			// giving off a thin, wavering thread.
 			// =====================================================================
 
-			const [smokeCanvas, smokeCtx] = makeCanvas(64, 64);
-			const smokeGradient = smokeCtx.createRadialGradient(32, 32, 0, 32, 32, 32);
-			smokeGradient.addColorStop(0, "rgba(255, 255, 255, 0.9)");
-			smokeGradient.addColorStop(0.4, "rgba(255, 255, 255, 0.35)");
-			smokeGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
-			smokeCtx.fillStyle = smokeGradient;
-			smokeCtx.fillRect(0, 0, 64, 64);
-			const smokeTexture = colorTexture(smokeCanvas);
-
-			const puffs = Array.from({ length: 40 }, () => {
-				const sprite = new THREE.Sprite(
-					new THREE.SpriteMaterial({ map: smokeTexture, color: "#b8b1a6", depthWrite: false, opacity: 0 }),
-				);
-				sprite.visible = false;
-				scene.add(sprite);
-				return { sprite, age: 0, life: 0, phase: 0, spin: 0 };
-			});
-			let smokeLeft = 0; // seconds of smoke still to come
+			const pointScale = { value: 1 }; // set in resize()
+			const SMOKE_MAX = 500;
+			const smokeGeometry = new THREE.BufferGeometry();
+			const smokePositions = new Float32Array(SMOKE_MAX * 3);
+			const smokeSize = new Float32Array(SMOKE_MAX);
+			const smokeAlpha = new Float32Array(SMOKE_MAX);
+			smokeGeometry.setAttribute("position", new THREE.BufferAttribute(smokePositions, 3));
+			smokeGeometry.setAttribute("aSize", new THREE.BufferAttribute(smokeSize, 1));
+			smokeGeometry.setAttribute("aAlpha", new THREE.BufferAttribute(smokeAlpha, 1));
+			const smokePoints = new THREE.Points(
+				smokeGeometry,
+				new THREE.ShaderMaterial({
+					uniforms: { uScale: pointScale },
+					transparent: true,
+					depthWrite: false,
+					vertexShader: `
+						attribute float aSize;
+						attribute float aAlpha;
+						uniform float uScale;
+						varying float vAlpha;
+						void main() {
+							vAlpha = aAlpha;
+							vec4 mv = modelViewMatrix * vec4(position, 1.0);
+							gl_PointSize = aSize * uScale / -mv.z;
+							gl_Position = projectionMatrix * mv;
+						}
+					`,
+					fragmentShader: `
+						varying float vAlpha;
+						void main() {
+							float d = length(gl_PointCoord - 0.5);
+							gl_FragColor = vec4(0.78, 0.75, 0.71, smoothstep(0.5, 0.1, d) * vAlpha);
+						}
+					`,
+				}),
+			);
+			smokePoints.frustumCulled = false;
+			scene.add(smokePoints);
+			const smoke = Array.from({ length: SMOKE_MAX }, () => ({ age: 1, life: 0, burst: false, phase: 0 }));
+			const smokeEmitters = [];
+			let smokeNext = 0;
 
 			function updateSmoke(dt, t) {
-				if (smokeLeft > 0) {
-					smokeLeft -= dt;
-					// Thick at first, thinning out.
-					const puff = Math.random() < dt * 16 * (smokeLeft / 3) && puffs.find((p) => p.life === 0);
-					if (puff) {
-						Object.assign(puff, { age: 0, life: 4.5 + 1.5 * Math.random(), phase: Math.random() * TAU, spin: Math.random() - 0.5 });
-						flame.getWorldPosition(puff.sprite.position); // the flame's base is at the wick
-						puff.sprite.visible = true;
+				for (const emitter of smokeEmitters) {
+					emitter.age += dt;
+					const burst = emitter.age < 2;
+					emitter.carry += (burst ? 30 * (1 - emitter.age / 2) + 16 : 16) * dt;
+					while (emitter.carry >= 1) {
+						emitter.carry -= 1;
+						const i = smokeNext;
+						smokeNext = (smokeNext + 1) % SMOKE_MAX;
+						Object.assign(smoke[i], { age: 0, life: burst ? 4.5 : 5.5, burst, phase: Math.random() * TAU });
+						emitter.flame.mesh.getWorldPosition(_v);
+						smokePositions.set([_v.x, _v.y + 0.01, _v.z], i * 3);
+					}
+				}
+				for (let i = 0; i < SMOKE_MAX; i++) {
+					const puff = smoke[i];
+					if (puff.age >= puff.life) {
+						smokeAlpha[i] = 0;
+						continue;
+					}
+					puff.age += dt;
+					const k = Math.min(1, puff.age / puff.life);
+					const wave = Math.sin(t * 1.7 + puff.phase + puff.age * 1.3);
+					smokePositions[i * 3] += wave * 0.05 * (1 + k * 2) * dt;
+					smokePositions[i * 3 + 1] += (puff.burst ? 0.35 : 0.28) * (1 - 0.4 * k) * dt;
+					smokePositions[i * 3 + 2] += Math.cos(t * 1.3 + puff.phase) * 0.03 * (1 + k) * dt;
+					smokeSize[i] = puff.burst ? 0.05 + 0.3 * k : 0.03 + 0.14 * k;
+					smokeAlpha[i] = (puff.burst ? 0.32 : 0.22) * (1 - k) * Math.min(1, puff.age * 4);
+				}
+				smokeGeometry.attributes.position.needsUpdate = true;
+				smokeGeometry.attributes.aSize.needsUpdate = true;
+				smokeGeometry.attributes.aAlpha.needsUpdate = true;
+			}
+
+			// =====================================================================
+			// Picking up and clicking
+			// A press on something interactive takes the pointer away from the
+			// camera controls. Small movement + release = click; otherwise it's a
+			// drag: the body is pulled toward the pointer on a plane facing the
+			// camera, still colliding with everything, and falls when let go.
+			// =====================================================================
+
+			const raycaster = new THREE.Raycaster();
+			const pointerNDC = new THREE.Vector2();
+			// Things that block picking: you can't grab what's hidden behind the pumpkin.
+			const occluders = pumpkin.children.filter((child) => child.isMesh && child.material !== wireMaterial);
+			const pickables = [...interactives.map((entry) => entry.object), lidRoot, ...occluders];
+			interactives.push({ object: lidRoot, body: lidBody });
+
+			function pick(event) {
+				pointerNDC.set((event.clientX / innerWidth) * 2 - 1, -(event.clientY / innerHeight) * 2 + 1);
+				raycaster.setFromCamera(pointerNDC, camera);
+				for (const hit of raycaster.intersectObjects(pickables, true)) {
+					if (hit.object.material === wireMaterial || !hit.object.visible) continue;
+					for (let object = hit.object; object; object = object.parent) {
+						const entry = interactives.find((e) => e.object === object);
+						if (entry) return { entry, point: hit.point };
+					}
+					return null; // something else is in the way
+				}
+				return null;
+			}
+
+			let press = null; // { entry, point, x, y, dragging }
+			const dragPlane = new THREE.Plane();
+			const dragOffset = new THREE.Vector3();
+			const dragTarget = new THREE.Vector3();
+
+			addEventListener(
+				"pointerdown",
+				(event) => {
+					if (!event.isPrimary || event.button !== 0 || event.target !== renderer.domElement) return;
+					const hit = pick(event);
+					if (!hit) return;
+					controls.enabled = false; // the controls' own listener runs after this one
+					press = { ...hit, x: event.clientX, y: event.clientY, dragging: false };
+					dragTarget.copy(hit.point);
+				},
+				{ capture: true },
+			);
+
+			addEventListener(
+				"pointermove",
+				(event) => {
+					if (!press || !event.isPrimary) return;
+					if (!press.dragging && press.entry.body && Math.hypot(event.clientX - press.x, event.clientY - press.y) > 6) {
+						const body = press.entry.body;
+						body.wakeUp();
+						body.setGravityScale(0, true);
+						camera.getWorldDirection(_v);
+						dragPlane.setFromNormalAndCoplanarPoint(_v, press.point);
+						const t = body.translation();
+						dragOffset.set(press.point.x - t.x, press.point.y - t.y, press.point.z - t.z);
+						press.dragging = true;
+						renderer.domElement.style.cursor = "grabbing";
+					}
+					if (press.dragging) {
+						pointerNDC.set((event.clientX / innerWidth) * 2 - 1, -(event.clientY / innerHeight) * 2 + 1);
+						raycaster.setFromCamera(pointerNDC, camera);
+						raycaster.ray.intersectPlane(dragPlane, dragTarget);
+					}
+				},
+				{ capture: true },
+			);
+
+			function release(event) {
+				if (!press || !event.isPrimary) return;
+				if (press.dragging) {
+					press.entry.body.setGravityScale(1, true);
+					renderer.domElement.style.cursor = "";
+				} else if (Math.hypot(event.clientX - press.x, event.clientY - press.y) <= 6) {
+					press.entry.onClick?.();
+				}
+				press = null;
+				controls.enabled = true;
+				sweep.idle = 0;
+			}
+			addEventListener("pointerup", release, { capture: true });
+			addEventListener("pointercancel", release, { capture: true });
+
+			function updateDrag() {
+				if (!press?.dragging) return;
+				const body = press.entry.body;
+				const t = body.translation();
+				_v.set(dragTarget.x - dragOffset.x - t.x, dragTarget.y - dragOffset.y - t.y, dragTarget.z - dragOffset.z - t.z).multiplyScalar(14);
+				if (_v.length() > 30) _v.setLength(30);
+				body.setLinvel({ x: _v.x, y: _v.y, z: _v.z }, true);
+				const w = body.angvel();
+				body.setAngvel({ x: w.x * 0.85, y: w.y * 0.85, z: w.z * 0.85 }, true);
+			}
+
+			let physicsTime = 0;
+			function stepPhysics(dt) {
+				physicsTime += dt;
+				while (physicsTime >= PHYSICS_STEP) {
+					updateDrag();
+					world.step();
+					physicsTime -= PHYSICS_STEP;
+				}
+				for (const { body, object } of dynamicBodies) {
+					const t = body.translation();
+					const r = body.rotation();
+					object.position.set(t.x, t.y, t.z);
+					object.quaternion.set(r.x, r.y, r.z, r.w);
+				}
+			}
+
+			for (let i = 0; i < 120; i++) world.step(); // settle before the first frame
+
+			// =====================================================================
+			// Little lives of things on the table
+			// =====================================================================
+
+			const dollHeadWorld = new THREE.Vector3();
+			function updateProps(dt, t) {
+				// Candles: ease each flame in or out; the cluster light follows them.
+				let clusterLit = 0;
+				for (const entry of flames) {
+					entry.lit += ((entry.on ? 1 : 0) - entry.lit) * Math.min(1, dt * 6);
+					if (entry === pumpkinFlame) continue;
+					const level = entry.lit * (0.92 + 0.06 * Math.sin(t * 7 + entry.material.uniforms.uPhase.value) + 0.04 * flicker);
+					entry.material.uniforms.uTime.value = t;
+					entry.material.uniforms.uSway.value = 0.1 * Math.sin(t * 1.1 + entry.material.uniforms.uPhase.value) + gust * gustSide;
+					entry.mesh.visible = entry.lit > 0.01;
+					entry.mesh.scale.set(entry.lit, (0.85 + 0.2 * level) * entry.lit, entry.lit);
+					entry.mesh.getWorldPosition(_v);
+					entry.mesh.rotation.y = Math.atan2(camera.position.x - _v.x, camera.position.z - _v.z);
+					entry.wax.userData.level.value = level;
+					clusterLit += level;
+				}
+				clusterLight.intensity = (CLUSTER_INTENSITY * clusterLit) / clusterFlames.length;
+
+				// Skull jaw.
+				jawChatter = Math.max(0, jawChatter - dt);
+				skull.userData.jaw.rotation.x = jawChatter > 0 ? 0.28 * Math.abs(Math.sin(t * 26)) * Math.min(1, jawChatter * 2) : 0;
+
+				// Doll: the head turns, slowly, to follow you; a click makes her blink.
+				const { head, eyes } = doll.userData;
+				head.getWorldPosition(dollHeadWorld);
+				const facing = Math.atan2(camera.position.x - dollHeadWorld.x, camera.position.z - dollHeadWorld.z) - doll.rotation.y;
+				const want = clamp(wrapAngle(facing), -1.1, 1.1);
+				head.rotation.y += clamp(want - head.rotation.y, -0.35 * dt, 0.35 * dt);
+				head.rotation.z = 0.18 + 0.03 * Math.sin(t * 0.4);
+				doll.userData.blink = Math.max(0, doll.userData.blink - dt * 2.5);
+				const close = Math.sin(Math.PI * doll.userData.blink);
+				eyes[0].rotation.x = -1.25 + 1.2 * close;
+				eyes[1].rotation.x = -0.9 + 0.85 * close;
+
+				// Most of the eyeballs turn, each at its own pace, to watch you.
+				for (const eye of eyeballs) {
+					if (!eye.watches) continue;
+					eye.look.getWorldPosition(eyeAim.position);
+					eyeAim.lookAt(camera.position);
+					eye.look.parent.getWorldQuaternion(_q).invert().multiply(eyeAim.quaternion);
+					eye.look.quaternion.slerp(_q, Math.min(1, dt * eye.rate));
+				}
+
+				updateSmoke(dt, t);
+			}
+
+			// =====================================================================
+			// Surroundings
+			// Fog, a churchyard of crooked trees and leaning stones, a huge low moon
+			// and a cauldron bubbling in the mist. All of it is seen through fog, so
+			// it's built for silhouette more than close-up detail.
+			// =====================================================================
+
+			rand = mulberry32(1337);
+			const envTime = { value: 0 };
+			scene.fog = new THREE.FogExp2("#1c2230", 0.026);
+
+			// Fog sheets: wide horizontal layers of drifting noise, thick near the
+			// ground and kept clear right around the table.
+			function fogTexture() {
+				const octave = (period) => {
+					const lattice = Float32Array.from({ length: period * period }, rand);
+					const at = (x, y) => lattice[(((y % period) + period) % period) * period + (((x % period) + period) % period)];
+					return (u, v) => {
+						const x = u * period;
+						const y = v * period;
+						const xi = Math.floor(x);
+						const yi = Math.floor(y);
+						const sx = smoothstep(0, 1, x - xi);
+						const sy = smoothstep(0, 1, y - yi);
+						const top = at(xi, yi) + (at(xi + 1, yi) - at(xi, yi)) * sx;
+						const bottom = at(xi, yi + 1) + (at(xi + 1, yi + 1) - at(xi, yi + 1)) * sx;
+						return top + (bottom - top) * sy;
+					};
+				};
+				const octaves = [octave(4), octave(8), octave(16)];
+				const [[canvas]] = paintCanvases(256, 256, 1, (x, y, out) => {
+					const u = x / 256;
+					const v = y / 256;
+					const n = 0.55 * octaves[0](u, v) + 0.3 * octaves[1](u, v) + 0.15 * octaves[2](u, v);
+					out[0][0] = out[0][1] = out[0][2] = 255 * smoothstep(0.3, 0.8, n);
+				});
+				const texture = dataTexture(canvas);
+				texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+				return texture;
+			}
+
+			const fogMap = fogTexture();
+			function fogSheet(y, opacity, clearRadius) {
+				const sheet = new THREE.Mesh(
+					new THREE.PlaneGeometry(240, 240).rotateX(-Math.PI / 2),
+					new THREE.ShaderMaterial({
+						uniforms: { uMap: { value: fogMap }, uTime: envTime, uOpacity: { value: opacity }, uClear: { value: clearRadius }, uSeed: { value: random(0, 10) } },
+						transparent: true,
+						depthWrite: false,
+						vertexShader: `
+							varying vec3 vWorld;
+							void main() {
+								vec4 world = modelMatrix * vec4(position, 1.0);
+								vWorld = world.xyz;
+								gl_Position = projectionMatrix * viewMatrix * world;
+							}
+						`,
+						fragmentShader: `
+							uniform sampler2D uMap;
+							uniform float uTime;
+							uniform float uOpacity;
+							uniform float uClear;
+							uniform float uSeed;
+							varying vec3 vWorld;
+							void main() {
+								vec2 p = vWorld.xz;
+								float a = texture2D(uMap, p * 0.03 + vec2(uTime * 0.004 + uSeed, uTime * 0.002)).r;
+								float b = texture2D(uMap, p * 0.08 - vec2(uTime * 0.006, uSeed - uTime * 0.003)).r;
+								float d = length(p);
+								float fade = smoothstep(uClear, uClear + 5.0, d) * (1.0 - smoothstep(70.0, 115.0, d));
+								gl_FragColor = vec4(0.36, 0.4, 0.48, a * (0.55 + 0.6 * b) * uOpacity * fade);
+							}
+						`,
+					}),
+				);
+				sheet.position.y = y;
+				sheet.renderOrder = 2;
+				scene.add(sheet);
+			}
+			for (const [height, opacity] of [
+				[0.15, 0.45],
+				[0.45, 0.4],
+				[0.85, 0.34],
+				[1.4, 0.28],
+				[2.1, 0.22],
+				[3.0, 0.16],
+			]) {
+				fogSheet(groundY + height, opacity, 0);
+			}
+			for (const y of [-1.4, -0.5, 0.5, 1.6]) fogSheet(y, 0.16, 7);
+
+			// --- Bare, crooked trees whose thin branches curl at the tips --------
+
+			const barkMaterial = new THREE.MeshStandardMaterial({ color: "#1e1915", roughness: 1 });
+
+			function buildTree(height, crooked, perch) {
+				const parts = [];
+				const grow = (start, direction, length, radius, depth) => {
+					const points = [start.clone()];
+					const d = direction.clone();
+					const curlAxis = new THREE.Vector3(random(-1, 1), random(-0.3, 0.3), random(-1, 1)).normalize();
+					const curl = depth >= 2 ? random(0.3, 0.7) * (rand() < 0.5 ? -1 : 1) : 0;
+					let p = start.clone();
+					for (let i = 1; i <= 6; i++) {
+						d.add(new THREE.Vector3(random(-1, 1), random(-0.4, 0.6), random(-1, 1)).multiplyScalar(crooked)).normalize();
+						if (curl) d.applyAxisAngle(curlAxis, curl * (i / 6) * 1.5); // tips curl round on themselves
+						p = p.clone().addScaledVector(d, length / 6);
+						points.push(p);
+					}
+					parts.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 18, radius, 7, false));
+					if (depth >= 4 || radius < 0.05) return;
+					for (let c = 0, count = depth === 0 ? randInt(3, 4) : randInt(2, 3); c < count; c++) {
+						const at = points[randInt(2, 6)];
+						const branch = d.clone().add(new THREE.Vector3(random(-1.3, 1.3), random(-0.2, 0.7), random(-1.3, 1.3))).normalize();
+						grow(at, branch, length * random(0.5, 0.75), radius * random(0.45, 0.62), depth + 1);
+					}
+				};
+				grow(new THREE.Vector3(0, -0.5, 0), new THREE.Vector3(random(-0.15, 0.15), 1, random(-0.15, 0.15)).normalize(), height * 0.45, height * 0.032, 0);
+				for (let r = 0; r < 5; r++) {
+					const a = (r / 5) * TAU + random(-0.3, 0.3);
+					const out = new THREE.Vector3(Math.cos(a), 0, Math.sin(a));
+					const root = [new THREE.Vector3(0, height * 0.05, 0), out.clone().multiplyScalar(height * 0.04).setY(height * 0.01), out.clone().multiplyScalar(height * 0.08).setY(-0.4)];
+					parts.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(root), 10, height * 0.014, 6, false));
+				}
+				if (perch) {
+					const points = [perch.from, perch.from.clone().lerp(perch.to, 0.5).add(new THREE.Vector3(0, 0.6, 0)), perch.to];
+					parts.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 16, 0.35, 7, false));
+				}
+				return mergeGeometries(parts);
+			}
+
+			// The big gnarled tree stands in front of the moon, with a bare branch
+			// for the vulture.
+			const perch = { from: new THREE.Vector3(0, 13, 0), to: new THREE.Vector3(8, 15.5, 2) };
+			const trees = [
+				[-11, -34, 46, 0.35, perch],
+				[13, -29, 38, 0.3],
+				[-25, -19, 34, 0.32],
+				[24, -42, 44, 0.28],
+				[-3, -56, 52, 0.3],
+				[8, -72, 46, 0.3],
+				[-33, -48, 40, 0.3],
+				[30, -16, 30, 0.34],
+			];
+			const bigTree = new THREE.Vector3(trees[0][0], groundY, trees[0][1]);
+			for (const [x, z, height, crooked, branch] of trees) {
+				const tree = new THREE.Mesh(buildTree(height, crooked, branch), barkMaterial);
+				tree.position.set(x, groundY, z);
+				scene.add(tree);
+			}
+
+			// --- Gravestones ------------------------------------------------------
+
+			function stoneTextures() {
+				const [[colorCanvas], [bumpCanvas]] = paintCanvases(512, 512, 2, (x, y, out) => {
+					const n = woodNoise(x * 0.02 + 5000, y * 0.02) * 0.5 + woodNoise(x * 0.08 + 5100, y * 0.08) * 0.3 + woodNoise(x * 0.4 + 5200, y * 0.4) * 0.2;
+					const moss = smoothstep(0.55, 0.75, woodNoise(x * 0.015 + 5300, y * 0.015)) * smoothstep(150, 512, y);
+					const lichen = smoothstep(0.78, 0.86, woodNoise(x * 0.06 + 5400, y * 0.06));
+					out[0][0] = 70 + 50 * n - 30 * moss + 60 * lichen;
+					out[0][1] = 72 + 48 * n - 5 * moss + 55 * lichen;
+					out[0][2] = 70 + 42 * n - 35 * moss + 35 * lichen;
+					out[1][0] = out[1][1] = out[1][2] = 255 * n;
+				});
+				const map = colorTexture(colorCanvas);
+				const bumpMap = dataTexture(bumpCanvas);
+				for (const texture of [map, bumpMap]) {
+					texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+					texture.repeat.set(0.25, 0.25);
+				}
+				return new THREE.MeshStandardMaterial({ map, bumpMap, bumpScale: 3, roughness: 0.95 });
+			}
+			const stoneMaterial = stoneTextures();
+
+			function buildGravestone(kind) {
+				const width = random(2.6, 3.6);
+				const height = random(4.2, 6.2);
+				const depth = random(0.5, 0.7);
+				const shape = new THREE.Shape();
+				shape.moveTo(-width / 2, 0);
+				if (kind === 0) {
+					shape.lineTo(-width / 2, height - width / 2);
+					shape.absarc(0, height - width / 2, width / 2, Math.PI, 0, true);
+				} else {
+					shape.lineTo(-width / 2, height - width * 0.6);
+					shape.quadraticCurveTo(-width / 2, height - width * 0.15, 0, height);
+					shape.quadraticCurveTo(width / 2, height - width * 0.15, width / 2, height - width * 0.6);
+				}
+				shape.lineTo(width / 2, 0);
+				shape.closePath();
+				const geometry = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: true, bevelThickness: 0.08, bevelSize: 0.08, bevelSegments: 2, curveSegments: 20 });
+				geometry.translate(0, 0, -depth / 2);
+				// Weathered: chipped, uneven edges.
+				const offset = random(0, 100);
+				return displace(geometry, (x, y, z) => {
+					const k = 1 + 0.04 * (woodNoise(x * 1.5 + offset, y * 1.5) - 0.5);
+					return [x * k, y + 0.12 * (woodNoise(x * 2 + offset, z * 3) - 0.5) * smoothstep(height * 0.7, height, y), z * k];
+				});
+			}
+
+			function buildCross() {
+				const parts = [new THREE.BoxGeometry(0.7, 6, 0.6).translate(0, 3, 0), new THREE.BoxGeometry(3, 0.7, 0.6).translate(0, 4.2, 0)];
+				return mergeGeometries(parts.map((part) => part.toNonIndexed()));
+			}
+
+			for (const [x, z] of [
+				[-9, -10],
+				[-13, -17],
+				[-6, -25],
+				[-1.5, -28],
+				[4.5, -26],
+				[10, -23],
+				[14, -13],
+				[11, -9],
+				[-16, -29],
+				[18, -31],
+				[-4, -38],
+				[8, -39],
+				[-21, -11],
+				[22, -24],
+			]) {
+				const stone = new THREE.Mesh(rand() < 0.18 ? buildCross() : buildGravestone(rand() < 0.6 ? 0 : 1), stoneMaterial);
+				stone.position.set(x, groundY - random(0.2, 0.6), z);
+				stone.rotation.set(random(-0.14, 0.14), Math.atan2(-x, 5 - z) + random(-0.4, 0.4), random(-0.12, 0.12));
+				stone.castShadow = true;
+				stone.receiveShadow = true;
+				scene.add(stone);
+			}
+
+			// --- The moon: huge, low, and a little too detailed --------------------
+
+			function moonTexture() {
+				const w = 2048;
+				const h = 1024;
+				// The near side faces +z, which is u = 0.25. Its dark plains are
+				// arranged, faintly, like a face.
+				const plain = (u, v, cu, cv, ru, rv) => Math.exp(-(((u - cu) / ru) ** 2 + ((v - cv) / rv) ** 2));
+				const [[canvas, ctx]] = paintCanvases(w, h, 1, (x, y, out) => {
+					const u = x / w;
+					const v = y / h;
+					const n = woodNoise(u * 14 + 7000, v * 7, 14) * 0.5 + woodNoise(u * 48 + 7100, v * 24, 48) * 0.3 + woodNoise(u * 180 + 7200, v * 90, 180) * 0.2;
+					const maria = Math.max(
+						plain(u, v, 0.215, 0.41, 0.03, 0.065),
+						plain(u, v, 0.29, 0.4, 0.034, 0.07),
+						plain(u, v, 0.255, 0.6, 0.075, 0.035) * 0.9,
+						smoothstep(0.58, 0.75, woodNoise(u * 6 + 7300, v * 3, 6)) * 0.8,
+					);
+					const g = 196 + 50 * (n - 0.5) - 92 * maria * (0.7 + 0.3 * n);
+					out[0][0] = g;
+					out[0][1] = g * 0.97;
+					out[0][2] = g * 0.92;
+				});
+
+				// Craters: shadowed floor, a lit rim toward the upper left, a dark rim
+				// opposite, and bright rays from a few young ones.
+				const crater = (x, y, r) => {
+					const floor = ctx.createRadialGradient(x, y, 0, x, y, r);
+					floor.addColorStop(0, "rgba(40, 38, 36, 0.35)");
+					floor.addColorStop(0.8, "rgba(60, 58, 55, 0.2)");
+					floor.addColorStop(1, "rgba(60, 58, 55, 0)");
+					ctx.fillStyle = floor;
+					ctx.beginPath();
+					ctx.arc(x, y, r, 0, TAU);
+					ctx.fill();
+					ctx.lineWidth = Math.max(1, r * 0.18);
+					ctx.strokeStyle = "rgba(255, 250, 240, 0.35)";
+					ctx.beginPath();
+					ctx.arc(x, y, r, Math.PI * 0.95, Math.PI * 1.7);
+					ctx.stroke();
+					ctx.strokeStyle = "rgba(20, 18, 16, 0.4)";
+					ctx.beginPath();
+					ctx.arc(x, y, r, Math.PI * 1.95, Math.PI * 2.7);
+					ctx.stroke();
+				};
+				for (let i = 0; i < 1400; i++) crater(random(0.03, 0.47) * w, random(0.1, 0.9) * h, random(1.5, 5));
+				for (let i = 0; i < 160; i++) crater(random(0.03, 0.47) * w, random(0.12, 0.88) * h, random(6, 22));
+				for (let i = 0; i < 12; i++) {
+					const x = random(0.06, 0.44) * w;
+					const y = random(0.18, 0.82) * h;
+					const r = random(26, 60);
+					if (i < 3) {
+						ctx.strokeStyle = "rgba(255, 252, 240, 0.07)";
+						for (let ray = 0; ray < 26; ray++) {
+							const a = random(0, TAU);
+							const len = random(120, 420);
+							ctx.lineWidth = random(1, 4);
+							ctx.beginPath();
+							ctx.moveTo(x, y);
+							ctx.lineTo(x + Math.cos(a) * len, y + Math.sin(a) * len * 0.5);
+							ctx.stroke();
+						}
+					}
+					crater(x, y, r);
+				}
+				return colorTexture(canvas);
+			}
+
+			const MOON_DISTANCE = 250;
+			const moonDirection = new THREE.Vector3(-0.36, 0.095, -1).normalize();
+			const MOON_RADIUS = MOON_DISTANCE * Math.tan(THREE.MathUtils.degToRad(5));
+			const moonDisc = new THREE.Mesh(
+				new THREE.SphereGeometry(MOON_RADIUS, 64, 48),
+				new THREE.ShaderMaterial({
+					uniforms: { uMap: { value: moonTexture() } },
+					vertexShader: `
+						varying vec2 vUv;
+						varying float vFacing;
+						void main() {
+							vUv = uv;
+							vec3 n = normalize(normalMatrix * normal);
+							vec4 mv = modelViewMatrix * vec4(position, 1.0);
+							vFacing = max(dot(n, normalize(-mv.xyz)), 0.0);
+							gl_Position = projectionMatrix * mv;
+						}
+					`,
+					fragmentShader: `
+						uniform sampler2D uMap;
+						varying vec2 vUv;
+						varying float vFacing;
+						void main() {
+							vec3 color = texture2D(uMap, vUv).rgb * vec3(1.0, 0.86, 0.68);
+							gl_FragColor = vec4(color * (0.55 + 0.45 * pow(vFacing, 0.6)), 1.0);
+						}
+					`,
+				}),
+			);
+			moonDisc.position.copy(moonDirection).multiplyScalar(MOON_DISTANCE);
+			moonDisc.rotation.y = Math.atan2(-moonDirection.x, -moonDirection.z); // near side toward us
+			scene.add(moonDisc);
+
+			const [haloCanvas, haloCtx] = makeCanvas(256, 256);
+			const haloGradient = haloCtx.createRadialGradient(128, 128, 20, 128, 128, 128);
+			haloGradient.addColorStop(0, "rgba(255, 210, 160, 0.55)");
+			haloGradient.addColorStop(0.35, "rgba(200, 160, 130, 0.18)");
+			haloGradient.addColorStop(1, "rgba(120, 110, 120, 0)");
+			haloCtx.fillStyle = haloGradient;
+			haloCtx.fillRect(0, 0, 256, 256);
+			const moonHalo = new THREE.Sprite(
+				new THREE.SpriteMaterial({ map: colorTexture(haloCanvas), blending: THREE.AdditiveBlending, depthWrite: false, fog: false, opacity: 0.6 }),
+			);
+			moonHalo.position.copy(moonDirection).multiplyScalar(MOON_DISTANCE + MOON_RADIUS * 2);
+			moonHalo.scale.setScalar(MOON_RADIUS * 9);
+			scene.add(moonHalo);
+
+			// --- The cauldron, out in the fog to the right ----------------------
+
+			const cauldron = new THREE.Group();
+			const ironMaterial = new THREE.MeshStandardMaterial({ color: "#1b1a19", metalness: 0.7, roughness: 0.6 });
+			cauldron.add(
+				new THREE.Mesh(
+					lathe([
+						[0.001, 0.25],
+						[0.9, 0.2],
+						[1.4, 0.5],
+						[1.65, 1.1],
+						[1.6, 1.7],
+						[1.35, 2.05],
+						[1.42, 2.15],
+						[1.48, 2.26],
+						[1.32, 2.28],
+						[1.26, 2.1],
+						[1.3, 1.8],
+					]),
+					ironMaterial,
+				),
+			);
+			for (let i = 0; i < 3; i++) {
+				const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.18, 0.5, 8), ironMaterial);
+				leg.position.set(Math.cos((i / 3) * TAU) * 0.9, 0.2, Math.sin((i / 3) * TAU) * 0.9);
+				cauldron.add(leg);
+			}
+			// Embers under the pot.
+			const emberGlow = new THREE.MeshStandardMaterial({ color: "#000", emissive: "#ff5a14", emissiveIntensity: 1.2 });
+			for (let i = 0; i < 4; i++) {
+				const log = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.14, 1.4, 8), i % 2 ? emberGlow : barkMaterial);
+				log.rotation.set(Math.PI / 2, 0, (i / 4) * Math.PI + random(-0.2, 0.2));
+				log.position.y = 0.12;
+				cauldron.add(log);
+			}
+			const potionMaterial = new THREE.ShaderMaterial({
+				uniforms: { ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog), uTime: envTime, uSurge: { value: 0 } },
+				fog: true,
+				vertexShader: `
+					#include <fog_pars_vertex>
+					varying vec2 vUv;
+					void main() {
+						vUv = uv;
+						vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+						gl_Position = projectionMatrix * mvPosition;
+						#include <fog_vertex>
+					}
+				`,
+				fragmentShader: `
+					#include <fog_pars_fragment>
+					uniform float uTime;
+					uniform float uSurge;
+					varying vec2 vUv;
+					void main() {
+						vec2 p = vUv * 2.0 - 1.0;
+						float r = length(p);
+						float a = atan(p.y, p.x);
+						float swirl = sin(a * 3.0 + r * 8.0 - uTime * 1.2) * 0.5 + 0.5;
+						float n = sin(p.x * 9.0 + uTime * 1.3) * sin(p.y * 8.0 - uTime * 1.1) * 0.5 + 0.5;
+						float glow = 0.35 + 0.35 * swirl * n + 0.3 * uSurge;
+						vec3 color = mix(vec3(0.04, 0.3, 0.05), vec3(0.5, 1.0, 0.35), glow);
+						gl_FragColor = vec4(color * smoothstep(1.0, 0.8, r), 1.0);
+						#include <fog_fragment>
+					}
+				`,
+			});
+			const potion = new THREE.Mesh(new THREE.CircleGeometry(1.3, 40).rotateX(-Math.PI / 2), potionMaterial);
+			potion.position.y = 1.95;
+			cauldron.add(potion);
+			const bubbleMaterial = new THREE.MeshBasicMaterial({ color: "#8dff6e" });
+			const bubbles = Array.from({ length: 10 }, () => {
+				const bubble = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 8), bubbleMaterial);
+				cauldron.add(bubble);
+				return { mesh: bubble, age: random(0, 1), size: random(0.08, 0.22), x: 0, z: 0 };
+			});
+			const vaporMaterial = new THREE.SpriteMaterial({ map: colorTexture(glowCanvas), color: "#5dff70", blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0 });
+			const vapors = Array.from({ length: 12 }, (_, i) => {
+				const sprite = new THREE.Sprite(vaporMaterial.clone());
+				cauldron.add(sprite);
+				return { sprite, age: i / 12 };
+			});
+			const CAULDRON_INTENSITY = 4;
+			const cauldronLight = new THREE.PointLight("#4dff5e", CAULDRON_INTENSITY, 11, 1.6);
+			cauldronLight.position.y = 3.2;
+			cauldron.add(cauldronLight);
+			cauldron.position.set(8, groundY, -10); // out to the right, clear of the table from most angles
+			scene.add(cauldron);
+			let cauldronSurge = 0;
+			interactives.push({ object: cauldron, onClick: () => (cauldronSurge = 2.5) });
+			pickables.push(cauldron);
+
+			// --- A broom, bristles up, leaning against the table -----------------
+
+			function buildBroom() {
+				const broom = new THREE.Group();
+				const handle = [0, 0.25, 0.5, 0.75, 1].map((t) => new THREE.Vector3(0.06 * Math.sin(t * 7), t * 7.4, 0.05 * Math.cos(t * 5)));
+				broom.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(handle), 30, 0.075, 8), new THREE.MeshStandardMaterial({ color: "#3d2b1c", roughness: 0.9 })));
+				const straws = [];
+				for (let i = 0; i < 140; i++) {
+					const a = random(0, TAU);
+					const spread = random(0.05, 0.55);
+					const length = random(1.6, 2.2);
+					const start = new THREE.Vector3(Math.cos(a) * 0.1, 7.1, Math.sin(a) * 0.1);
+					const end = new THREE.Vector3(Math.cos(a) * spread, 7.1 + length, Math.sin(a) * spread);
+					straws.push(new THREE.TubeGeometry(new THREE.LineCurve3(start, end), 1, random(0.008, 0.016), 3, false));
+				}
+				broom.add(new THREE.Mesh(mergeGeometries(straws), new THREE.MeshStandardMaterial({ color: "#7d6638", roughness: 0.95 })));
+				const band = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.15, 0.35, 12), new THREE.MeshStandardMaterial({ color: "#2a1f16", roughness: 1 }));
+				band.position.y = 7.25;
+				broom.add(band);
+				return broom;
+			}
+			const broom = buildBroom();
+			broom.position.set(2.65, groundY, -1.45); // against the back corner, out of the camera's way
+			broom.rotation.set(-0.02, 0.3, 0.07);
+			scene.add(shadowed(broom));
+
+			// =====================================================================
+			// Creatures
+			// They come and go on their own timers, so there's usually one thing
+			// moving out there, rarely all of them at once.
+			// =====================================================================
+
+			// --- Bats ------------------------------------------------------------
+
+			const batMaterial = new THREE.MeshStandardMaterial({ color: "#151112", roughness: 0.9, side: THREE.DoubleSide });
+			const wingShape = new THREE.Shape();
+			[
+				[0, 0.06],
+				[0.35, 0.2],
+				[0.7, 0.24],
+				[1.0, 0.13],
+				[0.86, -0.04],
+				[0.76, -0.26],
+				[0.56, -0.12],
+				[0.43, -0.3],
+				[0.26, -0.13],
+				[0.1, -0.22],
+				[0, -0.1],
+			].forEach(([x, y], i) => (i ? wingShape.lineTo(x, y) : wingShape.moveTo(x, y)));
+			const wingGeometry = new THREE.ShapeGeometry(wingShape).rotateX(-Math.PI / 2);
+
+			function buildBat() {
+				const bat = new THREE.Group();
+				const body = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 8).scale(0.1, 0.09, 0.2), batMaterial);
+				const head = new THREE.Mesh(new THREE.SphereGeometry(0.075, 8, 6), batMaterial);
+				head.position.z = 0.2;
+				bat.add(body, head);
+				for (const side of [-1, 1]) {
+					const ear = new THREE.Mesh(new THREE.ConeGeometry(0.03, 0.09, 4), batMaterial);
+					ear.position.set(side * 0.035, 0.08, 0.2);
+					bat.add(ear);
+				}
+				const wings = [-1, 1].map((side) => {
+					const pivot = new THREE.Group();
+					pivot.position.x = side * 0.06;
+					const wing = new THREE.Mesh(wingGeometry, batMaterial);
+					wing.scale.x = side;
+					pivot.add(wing);
+					bat.add(pivot);
+					return pivot;
+				});
+				bat.userData = { wings, phase: random(0, TAU), speed: random(14, 19) };
+				bat.visible = false;
+				scene.add(bat);
+				return bat;
+			}
+
+			const flockBats = Array.from({ length: 14 }, buildBat);
+			const treeBats = Array.from({ length: 2 }, buildBat);
+			treeBats.forEach((bat) => (bat.visible = true));
+			let flock = null;
+			let nextFlock = random(6, 12);
+
+			function flap(bat, t) {
+				const angle = Math.sin(t * bat.userData.speed + bat.userData.phase) * 0.95;
+				bat.userData.wings[0].rotation.z = -angle;
+				bat.userData.wings[1].rotation.z = angle;
+			}
+
+			function startFlock() {
+				const fromLeft = rand() < 0.5 ? -1 : 1;
+				const path = new THREE.CatmullRomCurve3([
+					new THREE.Vector3(fromLeft * 30, random(8, 14), random(-30, -15)),
+					new THREE.Vector3(fromLeft * 8, random(4, 7), random(-8, -3)),
+					new THREE.Vector3(random(-2, 2), random(2.5, 4.5), random(-1, 2)),
+					new THREE.Vector3(-fromLeft * 10, random(5, 9), random(4, 10)),
+					new THREE.Vector3(-fromLeft * 30, random(10, 16), random(10, 20)),
+				]);
+				const count = randInt(5, 14);
+				flock = {
+					path,
+					time: 0,
+					duration: random(6.5, 9),
+					bats: flockBats.slice(0, count).map((bat) => ({ bat, offset: new THREE.Vector3(random(-2, 2), random(-1, 1.2), random(-2, 2)), lag: random(0, 0.12), wobble: random(0, TAU) })),
+				};
+			}
+
+			// --- The witch, now and then, across the moon --------------------------
+
+			function buildWitch() {
+				const black = new THREE.MeshBasicMaterial({ color: "#040405" });
+				const witch = new THREE.Group();
+				const stick = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 5, 6).rotateZ(Math.PI / 2), black);
+				const bristles = new THREE.Mesh(new THREE.ConeGeometry(0.5, 1.5, 10, 1, true).rotateZ(Math.PI / 2), black);
+				bristles.position.x = -3;
+				const robe = new THREE.Mesh(new THREE.ConeGeometry(0.75, 1.9, 10), black);
+				robe.position.set(0.1, 0.8, 0);
+				robe.rotation.z = -0.35;
+				const head = new THREE.Mesh(new THREE.SphereGeometry(0.28, 10, 8), black);
+				head.position.set(0.55, 1.78, 0);
+				const brim = new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.62, 0.04, 16), black);
+				brim.position.set(0.5, 1.98, 0);
+				const hat = new THREE.Mesh(new THREE.ConeGeometry(0.32, 1.2, 10), black);
+				hat.position.set(0.3, 2.5, 0);
+				hat.rotation.z = 0.55;
+				const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.08, 0.7, 4, 6), black);
+				arm.position.set(0.85, 1.05, 0.15);
+				arm.rotation.z = -1.0;
+				const cape = new THREE.Mesh(new THREE.PlaneGeometry(2, 1.3, 10, 4), new THREE.MeshBasicMaterial({ color: "#040405", side: THREE.DoubleSide }));
+				cape.position.set(-1, 1.3, 0);
+				witch.add(stick, bristles, robe, head, brim, hat, arm, cape);
+				witch.userData = { cape, base: cape.geometry.attributes.position.array.slice() };
+				witch.scale.setScalar(2.2);
+				witch.visible = false;
+				scene.add(witch);
+				return witch;
+			}
+			const witch = buildWitch();
+			let witchFlight = null;
+			let nextWitch = random(14, 24);
+
+			// --- The vulture on the big tree --------------------------------------
+
+			function buildVulture() {
+				const dark = new THREE.MeshStandardMaterial({ color: "#1a1512", roughness: 0.95 });
+				const skin = new THREE.MeshStandardMaterial({ color: "#8a4e46", roughness: 0.7 });
+				const vulture = new THREE.Group();
+				const body = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12).scale(0.9, 1.1, 1.3), dark);
+				body.position.y = 1.4;
+				body.rotation.x = 0.5; // hunched
+				const tail = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.12, 1.1), dark);
+				tail.position.set(0, 0.6, -1.3);
+				tail.rotation.x = 0.9;
+				const wings = [-1, 1].map((side) => {
+					const pivot = new THREE.Group();
+					pivot.position.set(side * 0.55, 2.0, 0.2);
+					const wing = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8).scale(0.3, 0.9, 1.7), dark);
+					wing.position.set(side * 0.15, -0.45, -0.6);
+					wing.rotation.x = 0.45;
+					pivot.add(wing);
+					return pivot;
+				});
+				const ruff = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.15, 8, 16), new THREE.MeshStandardMaterial({ color: "#58524d", roughness: 1 }));
+				ruff.position.set(0, 2.3, 0.55);
+				ruff.rotation.x = Math.PI / 2 - 0.4;
+				const neckPivot = new THREE.Group();
+				neckPivot.position.set(0, 2.3, 0.6);
+				const neck = new THREE.Mesh(
+					new THREE.TubeGeometry(new THREE.CatmullRomCurve3([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0.35, 0.2), new THREE.Vector3(0, 0.45, 0.5)]), 8, 0.1, 6),
+					skin,
+				);
+				const head = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), skin);
+				head.position.set(0, 0.5, 0.6);
+				const beak = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.32, 6), new THREE.MeshStandardMaterial({ color: "#cdbb98", roughness: 0.5 }));
+				beak.position.set(0, 0.42, 0.85);
+				beak.rotation.x = Math.PI / 2 + 0.5;
+				neckPivot.add(neck, head, beak);
+				vulture.add(body, tail, ...wings, ruff, neckPivot);
+				vulture.userData = { wings, neck: neckPivot, look: 0, nextLook: 2, spread: 0, nextSpread: random(20, 35) };
+				return vulture;
+			}
+			const vulture = buildVulture();
+			vulture.scale.setScalar(1.5);
+			vulture.position.copy(bigTree).add(perch.from.clone().lerp(perch.to, 0.7)).add(new THREE.Vector3(0, 0.75, 0));
+			vulture.rotation.y = Math.atan2(-vulture.position.x, 5 - vulture.position.z) * 0.6;
+			scene.add(vulture);
+
+			// --- Spiders: they roam the table, and some go in and out of the face --
+
+			const spiderMaterial = new THREE.MeshStandardMaterial({ color: "#17110d", roughness: 0.5 });
+
+			// A thin cylinder from a to b.
+			function segment(a, b, radius, material) {
+				const length = a.distanceTo(b);
+				const mesh = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius * 0.7, length, 5), material);
+				mesh.position.copy(a).lerp(b, 0.5);
+				mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), b.clone().sub(a).normalize());
+				return mesh;
+			}
+
+			function buildSpider() {
+				const spider = new THREE.Group();
+				const abdomen = new THREE.Mesh(new THREE.SphereGeometry(1, 14, 10).scale(0.055, 0.045, 0.07), spiderMaterial);
+				abdomen.position.set(0, 0.055, -0.075);
+				const head = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8).scale(0.038, 0.03, 0.045), spiderMaterial);
+				head.position.set(0, 0.048, 0.02);
+				spider.add(abdomen, head);
+				const legs = [];
+				[0.6, 1.2, 1.9, 2.5].forEach((angle, i) => {
+					for (const side of [-1, 1]) {
+						const hip = new THREE.Group();
+						hip.position.set(side * 0.022, 0.048, 0.03 - i * 0.02);
+						const out = new THREE.Vector3(side * Math.sin(angle), 0, Math.cos(angle));
+						const knee = out.clone().multiplyScalar(0.075).setY(0.05);
+						const foot = out.clone().multiplyScalar(0.15).setY(-0.048);
+						hip.add(segment(new THREE.Vector3(), knee, 0.006, spiderMaterial), segment(knee, foot, 0.005, spiderMaterial));
+						spider.add(hip);
+						legs.push({ hip, group: (i + (side > 0 ? 1 : 0)) % 2 });
+					}
+				});
+				spider.userData.legs = legs;
+				scene.add(shadowed(spider));
+				return spider;
+			}
+
+			// Where holes start and end on the surface: the mouth is the lowest hole.
+			const holeBottoms = holes.map((hole) => hole.reduce((best, p) => (p[1] > best[1] ? p : best)));
+			const mouthIndex = holeBottoms.reduce((best, p, i) => (p[1] > holeBottoms[best][1] ? i : best), 0);
+			const mouthSpan = [Math.min(...holes[mouthIndex].map((p) => p[0])), Math.max(...holes[mouthIndex].map((p) => p[0]))];
+			const BASE_V = 0.9;
+
+			const spiderZones = [
+				[-1.75, 1.75, 1.0, 1.4],
+				[1.2, 1.9, -0.1, 1.3],
+				[-1.9, -1.15, -0.1, 0.1],
+			];
+			function tablePoint() {
+				const [x0, x1, z0, z1] = spiderZones[randInt(0, spiderZones.length - 1)];
+				return new THREE.Vector3(random(x0, x1), 0.005, random(z0, z1));
+			}
+
+			const _up = new THREE.Vector3();
+			const _forward = new THREE.Vector3();
+			const _right = new THREE.Vector3();
+			const _basis = new THREE.Matrix4();
+			const _surface = new THREE.Vector3();
+			const _normal = new THREE.Vector3();
+
+			// Point and outward normal on the pumpkin's skin, in world space.
+			function onPumpkin(u, v) {
+				surfacePoint(u, v, _surface);
+				surfaceNormal(u, v, _normal);
+				pumpkin.localToWorld(_surface);
+				_normal.transformDirection(pumpkin.matrixWorld);
+			}
+
+			function faceAlong(object, up, forward) {
+				_up.copy(up).normalize();
+				_forward.copy(forward).addScaledVector(_up, -_forward.dot(_up)).normalize();
+				_right.crossVectors(_up, _forward);
+				object.quaternion.setFromRotationMatrix(_basis.makeBasis(_right, _up, _forward));
+			}
+
+			const spiders = [0, 1, 2].map((i) => ({
+				object: buildSpider(),
+				mode: i === 0 ? "inside" : "walk",
+				timer: i === 0 ? random(3, 7) : 0,
+				target: tablePoint(),
+				path: null, // surface waypoints in (u, v)
+				leg: 0,
+				gait: random(0, TAU),
+			}));
+			spiders.forEach((spider) => {
+				spider.object.position.copy(tablePoint());
+				spider.object.visible = spider.mode !== "inside";
+			});
+			let spiderInPumpkin = false;
+
+			// Move along a list of (u, v) waypoints on the skin at a steady pace.
+			function crawlSurface(spider, dt) {
+				const [[u0, v0], [u1, v1]] = spider.path;
+				const s = Math.sin(Math.PI * v0);
+				const length = Math.hypot((u1 - u0) * TAU * W * s, (v1 - v0) * Math.PI * H) || 1e-6;
+				spider.leg = Math.min(1, spider.leg + (0.16 * dt) / length);
+				const u = u0 + (u1 - u0) * spider.leg;
+				const v = v0 + (v1 - v0) * spider.leg;
+				onPumpkin(u, v);
+				spider.object.position.copy(_surface);
+				onPumpkin(u0 + (u1 - u0) * Math.min(1, spider.leg + 0.02), v0 + (v1 - v0) * Math.min(1, spider.leg + 0.02));
+				const ahead = _surface.clone().sub(spider.object.position);
+				onPumpkin(u, v);
+				if (ahead.lengthSq() > 1e-10) faceAlong(spider.object, _normal, ahead);
+				if (spider.leg >= 1) {
+					spider.path.shift();
+					spider.leg = 0;
+				}
+				return spider.path.length < 2;
+			}
+
+			function updateSpiders(dt) {
+				for (const spider of spiders) {
+					const object = spider.object;
+					let moving = false;
+					if (spider.mode === "walk" || spider.mode === "toPumpkin") {
+						const to = spider.target.clone().sub(object.position).setY(0);
+						const distance = to.length();
+						if (spider.timer > 0) {
+							spider.timer -= dt;
+						} else if (distance > 0.02) {
+							object.position.addScaledVector(to.normalize(), Math.min(distance, 0.2 * dt));
+							object.position.y = 0.005;
+							faceAlong(object, new THREE.Vector3(0, 1, 0), to);
+							moving = true;
+						} else if (spider.mode === "toPumpkin") {
+							const [u, v] = holeBottoms[mouthIndex];
+							spider.path = [
+								[u, BASE_V],
+								[u, v + 0.012],
+							];
+							spider.mode = "climbIn";
+						} else if (!spiderInPumpkin && rand() < 0.35) {
+							spiderInPumpkin = true;
+							spider.mode = "toPumpkin";
+							onPumpkin(holeBottoms[mouthIndex][0], BASE_V);
+							spider.target.set(_surface.x, 0.005, _surface.z);
+						} else {
+							spider.target = tablePoint();
+							spider.timer = random(0.5, 3.5); // stop, then dart off
+						}
+					} else if (spider.mode === "climbIn" || spider.mode === "climbOut") {
+						moving = true;
+						if (crawlSurface(spider, dt)) {
+							if (spider.mode === "climbIn") {
+								spider.mode = "inside";
+								spider.object.visible = false;
+								spider.timer = random(6, 14);
+								spiderInPumpkin = false;
+							} else {
+								spider.mode = "walk";
+								spider.target = tablePoint();
+								spider.object.position.y = 0.005;
+							}
+						}
+					} else if (spider.mode === "inside") {
+						spider.timer -= dt;
+						if (spider.timer <= 0) {
+							// Out through an eye (or whatever isn't the mouth), sideways
+							// past the mouth, then down to the table.
+							const exits = holeBottoms.filter((_, i) => i !== mouthIndex);
+							const [u, v] = exits[randInt(0, exits.length - 1)];
+							const side = u < 0.5 ? mouthSpan[0] - 0.02 : mouthSpan[1] + 0.02;
+							spider.path = [
+								[u, v + 0.012],
+								[side, v + 0.012],
+								[side, BASE_V],
+							];
+							spider.mode = "climbOut";
+							spider.object.visible = true;
+						}
+					}
+					// Legs: two alternating sets, swinging as it moves.
+					if (moving) spider.gait += dt * 22;
+					for (const { hip, group } of object.userData.legs) {
+						hip.rotation.y = moving ? 0.28 * Math.sin(spider.gait + group * Math.PI) : 0;
+						hip.position.y = 0.048 + (moving ? 0.012 * Math.max(0, Math.sin(spider.gait + group * Math.PI)) : 0);
+					}
+				}
+			}
+
+			// --- The black cat, prowling between the far gravestones --------------
+
+			function buildCat() {
+				const fur = new THREE.MeshStandardMaterial({ color: "#09090b", roughness: 0.85 });
+				const cat = new THREE.Group();
+				const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.4, 1.3, 6, 12), fur);
+				body.rotation.x = Math.PI / 2;
+				body.position.y = 1.3;
+				body.scale.set(1, 1, 0.9);
+				const head = new THREE.Group();
+				head.position.set(0, 1.75, 1.2);
+				head.add(new THREE.Mesh(new THREE.SphereGeometry(0.36, 14, 10).scale(1, 0.9, 1), fur));
+				const muzzle = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 8), fur);
+				muzzle.position.set(0, -0.1, 0.3);
+				head.add(muzzle);
+				for (const side of [-1, 1]) {
+					const ear = new THREE.Mesh(new THREE.ConeGeometry(0.13, 0.32, 4), fur);
+					ear.position.set(side * 0.2, 0.33, -0.02);
+					ear.rotation.z = -side * 0.25;
+					const eye = new THREE.Mesh(new THREE.SphereGeometry(0.055, 8, 6), new THREE.MeshBasicMaterial({ color: "#c9f25a" }));
+					eye.position.set(side * 0.13, 0.04, 0.31);
+					head.add(ear, eye);
+				}
+				const legs = [
+					[0.22, 0.75],
+					[-0.22, 0.75],
+					[0.22, -0.65],
+					[-0.22, -0.65],
+				].map(([x, z], i) => {
+					const hip = new THREE.Group();
+					hip.position.set(x, 1.15, z);
+					const leg = new THREE.Mesh(new THREE.CapsuleGeometry(0.1, 0.85, 4, 8), fur);
+					leg.position.y = -0.55;
+					hip.add(leg);
+					cat.add(hip);
+					return { hip, phase: i === 0 || i === 3 ? 0 : Math.PI };
+				});
+				const tail = Array.from({ length: 9 }, (_, i) => {
+					const piece = new THREE.Mesh(new THREE.SphereGeometry(0.1 - i * 0.006, 8, 6), fur);
+					cat.add(piece);
+					return piece;
+				});
+				cat.add(body, head);
+				cat.userData = { head, legs, tail };
+				return cat;
+			}
+
+			const cat = buildCat();
+			scene.add(cat);
+			const catRoute = [
+				[-15, -24],
+				[-8, -23],
+				[-2, -25.5],
+				[5, -24],
+				[11, -26],
+				[16, -21],
+				[9, -30],
+				[0, -31],
+				[-10, -29],
+			].map(([x, z]) => new THREE.Vector3(x, groundY, z));
+			const catState = { leg: 0, from: 0, pause: 2, gait: 0 };
+			cat.position.copy(catRoute[0]);
+
+			function updateCat(dt, t) {
+				const { head, legs, tail } = cat.userData;
+				let walking = false;
+				if (catState.pause > 0) {
+					catState.pause -= dt;
+				} else {
+					const from = catRoute[catState.from];
+					const to = catRoute[(catState.from + 1) % catRoute.length];
+					const length = from.distanceTo(to);
+					catState.leg += (1.6 * dt) / length;
+					cat.position.lerpVectors(from, to, Math.min(1, catState.leg));
+					cat.rotation.y = Math.atan2(to.x - from.x, to.z - from.z);
+					walking = true;
+					if (catState.leg >= 1) {
+						catState.leg = 0;
+						catState.from = (catState.from + 1) % catRoute.length;
+						if (rand() < 0.45) catState.pause = random(3, 7); // stop and stare
+					}
+				}
+				if (walking) catState.gait += dt * 7;
+				for (const { hip, phase } of legs) hip.rotation.x = walking ? 0.45 * Math.sin(catState.gait + phase) : 0;
+				// When it stops, it turns its head to look at you.
+				const toCamera = wrapAngle(Math.atan2(camera.position.x - cat.position.x, camera.position.z - cat.position.z) - cat.rotation.y);
+				head.rotation.y += ((walking ? 0 : clamp(toCamera, -1.3, 1.3)) - head.rotation.y) * Math.min(1, dt * 2);
+				tail.forEach((piece, i) => {
+					const k = i / (tail.length - 1);
+					piece.position.set(Math.sin(t * 1.7 + k * 2.5) * 0.35 * k, 1.45 + Math.sin(k * 1.8) * 1.3, -1.05 - Math.cos(k * 1.4) * 0.55 * k - 0.15);
+				});
+			}
+
+			// --- Everything out there, per frame ----------------------------------
+
+			function updateSurroundings(dt, t) {
+				envTime.value = t;
+
+				// Cauldron: bubbles rise, swell and pop; green vapor drifts up; a click
+				// makes it surge.
+				cauldronSurge = Math.max(0, cauldronSurge - dt);
+				const surge = Math.min(1, cauldronSurge);
+				potionMaterial.uniforms.uSurge.value = surge;
+				cauldronLight.intensity = CAULDRON_INTENSITY * (0.85 + 0.1 * Math.sin(t * 2.3) + 0.05 * Math.sin(t * 5.1) + 0.8 * surge);
+				for (const bubble of bubbles) {
+					bubble.age += dt * (0.5 + 1.5 * surge);
+					if (bubble.age >= 1) {
+						bubble.age = 0;
+						const a = random(0, TAU);
+						const r = Math.sqrt(rand()) * 1.0;
+						bubble.x = Math.cos(a) * r;
+						bubble.z = Math.sin(a) * r;
+					}
+					const grow = Math.sin(Math.PI * bubble.age);
+					bubble.mesh.position.set(bubble.x, 1.95, bubble.z);
+					bubble.mesh.scale.set(bubble.size * grow, bubble.size * grow * 0.7, bubble.size * grow);
+				}
+				for (const vapor of vapors) {
+					vapor.age = (vapor.age + dt * (0.15 + 0.2 * surge)) % 1;
+					vapor.sprite.position.set(Math.sin(vapor.age * 5 + vapor.sprite.id) * 0.4, 2.1 + vapor.age * 3.5, Math.cos(vapor.age * 4 + vapor.sprite.id) * 0.4);
+					vapor.sprite.scale.setScalar(1 + vapor.age * 3);
+					vapor.sprite.material.opacity = (0.16 + 0.15 * surge) * Math.sin(Math.PI * vapor.age);
+				}
+
+				// A flock of bats now and then; two more always circling the big tree.
+				nextFlock -= dt;
+				if (!flock && nextFlock <= 0) startFlock();
+				if (flock) {
+					flock.time += dt;
+					for (const { bat, offset, lag, wobble } of flock.bats) {
+						const k = clamp(flock.time / flock.duration - lag, 0, 1);
+						bat.visible = k > 0 && k < 1;
+						flock.path.getPointAt(k, bat.position).add(offset).add(new THREE.Vector3(0, Math.sin(t * 6 + wobble) * 0.3, Math.cos(t * 5 + wobble) * 0.3));
+						bat.lookAt(flock.path.getPointAt(Math.min(1, k + 0.01), _v).add(offset));
+						flap(bat, t);
+					}
+					if (flock.time > flock.duration * 1.2) {
+						flock.bats.forEach(({ bat }) => (bat.visible = false));
+						flock = null;
+						nextFlock = random(15, 32);
+					}
+				}
+				treeBats.forEach((bat, i) => {
+					const a = t * (0.5 + i * 0.17) + i * 2;
+					const radius = 7 + 2 * Math.sin(t * 0.7 + i);
+					bat.position.set(bigTree.x + Math.cos(a) * radius, groundY + 14 + 3 * Math.sin(t * 1.3 + i * 3), bigTree.z + Math.sin(a) * radius);
+					bat.lookAt(bigTree.x + Math.cos(a + 0.1) * radius, bat.position.y, bigTree.z + Math.sin(a + 0.1) * radius);
+					flap(bat, t);
+				});
+
+				// The witch: across the face of the moon every minute or so.
+				nextWitch -= dt;
+				if (!witchFlight && nextWitch <= 0) {
+					witchFlight = { time: 0, duration: random(11, 15), rise: random(0.02, 0.07), height: random(0.04, 0.1) };
+					witch.visible = true;
+				}
+				if (witchFlight) {
+					witchFlight.time += dt;
+					const k = witchFlight.time / witchFlight.duration;
+					const azimuth = THREE.MathUtils.lerp(0.75, -1.25, k);
+					const direction = new THREE.Vector3(Math.sin(azimuth), witchFlight.height + witchFlight.rise * k + 0.01 * Math.sin(t * 2.2), -Math.cos(azimuth)).normalize();
+					witch.position.copy(direction).multiplyScalar(140);
+					witch.rotation.set(0.05 * Math.sin(t * 1.7), azimuth + Math.PI / 2 + Math.PI, 0.05 * Math.sin(t * 2.3));
+					const { cape, base } = witch.userData;
+					const position = cape.geometry.attributes.position;
+					for (let i = 0; i < position.count; i++) {
+						const x = base[i * 3];
+						position.setZ(i, Math.sin(t * 9 + x * 3) * 0.18 * (1 - x));
+					}
+					position.needsUpdate = true;
+					if (k >= 1) {
+						witch.visible = false;
+						witchFlight = null;
+						nextWitch = random(40, 75);
 					}
 				}
 
-				for (const puff of puffs) {
-					if (puff.life === 0) continue;
-					puff.age += dt;
-					const k = puff.age / puff.life;
-					if (k >= 1) {
-						puff.life = 0;
-						puff.sprite.visible = false;
-						continue;
-					}
-					const p = puff.sprite.position;
-					p.y += 0.38 * (1 - 0.4 * k) * dt;
-					p.x += (0.08 * Math.sin(t * 1.3 + puff.phase) + 0.05 * k) * dt; // curls, and a faint breeze
-					p.z += 0.06 * Math.cos(t * 1.7 + puff.phase) * dt;
-					puff.sprite.scale.setScalar(0.05 + 0.45 * k);
-					puff.sprite.material.opacity = 0.42 * (1 - k) * Math.min(1, puff.age * 5);
-					puff.sprite.material.rotation += puff.spin * dt;
+				// The vulture: looks around, and now and then half-opens its wings.
+				const vultureState = vulture.userData;
+				vultureState.nextLook -= dt;
+				if (vultureState.nextLook <= 0) {
+					vultureState.look = random(-1.1, 1.1);
+					vultureState.nextLook = random(2, 7);
 				}
+				vultureState.neck.rotation.y += (vultureState.look - vultureState.neck.rotation.y) * Math.min(1, dt * 3);
+				vultureState.nextSpread -= dt;
+				if (vultureState.nextSpread <= 0) {
+					vultureState.spread = 3;
+					vultureState.nextSpread = random(25, 45);
+				}
+				vultureState.spread = Math.max(0, vultureState.spread - dt);
+				const open = Math.sin((Math.PI * vultureState.spread) / 3) * 0.9;
+				vultureState.wings[0].rotation.z = open;
+				vultureState.wings[1].rotation.z = -open;
+
+				updateSpiders(dt);
+				updateCat(dt, t);
 			}
+
+			// =====================================================================
+			// Night lighting
+			// =====================================================================
+
+			scene.add(new THREE.HemisphereLight("#4f5672", "#1a120c", 1.5));
+
+			const moon = new THREE.DirectionalLight("#c3ccef", 1.5);
+			moon.position.set(-3.6, 7.5, -10); // same side as the moon in the sky, but higher
+			moon.castShadow = true;
+			moon.shadow.mapSize.set(2048, 2048);
+			Object.assign(moon.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near: 0.5, far: 25 });
+			moon.shadow.bias = -0.0005;
+			moon.shadow.normalBias = 0.02;
+			scene.add(moon);
+
+			// =====================================================================
+			// Camera
+			// Front-facing only. When left alone, the camera drifts slowly from
+			// side to side and turns back well before it gets around the pumpkin.
+			// =====================================================================
+
+			const SWING = 1.1; // how far you can orbit to either side (radians)
+			const SWEEP = 0.33; // how far the idle drift goes
+			controls.minAzimuthAngle = turn - SWING;
+			controls.maxAzimuthAngle = turn + SWING;
+			controls.target.copy(pumpkinCenter).y *= 0.95;
+			camera.position.set(Math.sin(turn) * 5 + 0.3, 1.5, Math.cos(turn) * 5);
+
+			const sweep = { idle: 0, velocity: 0, direction: 1, dragging: false };
+			controls.addEventListener("start", () => {
+				sweep.dragging = true;
+				sweep.velocity = 0;
+			});
+			controls.addEventListener("end", () => {
+				sweep.dragging = false;
+				sweep.idle = 0;
+			});
+
+			const _offset = new THREE.Vector3();
+			const _spherical = new THREE.Spherical();
+			function updateSweep(dt) {
+				if (sweep.dragging || press) return;
+				sweep.idle += dt;
+				_offset.subVectors(camera.position, controls.target);
+				// Wait a moment after the user lets go, and stay still up close.
+				if (sweep.idle < 3 || _offset.length() < 2.2) return;
+				_spherical.setFromVector3(_offset);
+				const angle = wrapAngle(_spherical.theta - turn);
+				if (angle > SWEEP) sweep.direction = -1;
+				if (angle < -SWEEP) sweep.direction = 1;
+				sweep.velocity += (sweep.direction * 0.09 - sweep.velocity) * Math.min(1, dt * 0.6);
+				_spherical.theta += sweep.velocity * dt;
+				camera.position.copy(controls.target).add(_offset.setFromSpherical(_spherical));
+			}
+
+			// =====================================================================
+			// Hint
+			// =====================================================================
+
+			const hint = document.createElement("div");
+			hint.textContent = "drag to look around · scroll or pinch to move in · drag things on the table · click or tap a flame";
+			Object.assign(hint.style, {
+				position: "fixed",
+				bottom: "14px",
+				left: "0",
+				right: "0",
+				textAlign: "center",
+				pointerEvents: "none",
+				color: "#c9b9a0",
+				font: "13px system-ui, sans-serif",
+				opacity: "0.6",
+				transition: "opacity 2s",
+			});
+			document.body.appendChild(hint);
+			setTimeout(() => (hint.style.opacity = "0"), 7000);
 
 			// =====================================================================
 			// Animation
@@ -1546,10 +3966,8 @@
 			let flickerTarget = 1;
 			let gust = 0;
 			let gustSide = 1;
-			let lit = 1; // eases between 0 and 1 when the candle is toggled
+			let lit = 1; // eases between 0 and 1 when the candle goes out
 			let ember = 1; // the wick keeps glowing a moment after the flame goes
-			let wasLit = true;
-			let lidProgress = 0; // 0 = on the pumpkin, 1 = on the table
 
 			const clock = new THREE.Clock();
 			const flameWorld = new THREE.Vector3();
@@ -1565,43 +3983,43 @@
 				gust *= Math.exp(-dt * 3);
 				flickerTarget += (Math.random() - 0.5) * dt * 2 + (1 - flickerTarget) * dt * 1.5;
 				flicker += (flickerTarget - flicker) * Math.min(1, dt * 12);
-
 				const on = settings.candleLit ? 1 : 0;
 				lit += (on - lit) * Math.min(1, dt * 6);
 				ember += (on - ember) * Math.min(1, dt * 1.2);
-				if (wasLit && !settings.candleLit) smokeLeft = 3;
-				wasLit = settings.candleLit;
-				updateSmoke(dt, t);
-
-				// Lid: lift, swing over in an arc with a tip, and set down beside it.
-				const lidBefore = lidProgress;
-				lidProgress = Math.min(1, Math.max(0, lidProgress + (settings.lidOff ? dt : -dt) / 1.4));
-				const e = lidProgress * lidProgress * (3 - 2 * lidProgress);
-				const arc = Math.sin(Math.PI * e);
-				lidPivot.position.lerpVectors(lidHome, lidRest, e).y += 0.6 * arc;
-				lidPivot.rotation.set(0.15 * arc, 0.9 * e, -0.45 * arc);
-				if (lidProgress !== lidBefore) moon.shadow.needsUpdate = true;
 
 				const level = flicker * (1 - gust) * (1 + 0.03 * Math.sin(t * 9.1) + 0.02 * Math.sin(t * 15.7 + 1.3)) * lit;
 				const sway = 0.15 * Math.sin(t * 1.3) * Math.sin(t * 0.7 + 1) + gust * gustSide * 2.5;
-
-				candleLight.intensity = CANDLE_INTENSITY * settings.brightness * level;
-				candleLight.position.set(lightHome.x + sway * 0.01, lightHome.y, lightHome.z + sway * 0.006);
-				waxMaterial.emissiveIntensity = 0.2 * level * Math.min(1, settings.brightness);
+				candleLight.intensity = CANDLE_INTENSITY * level;
+				bounceLight.intensity = BOUNCE_INTENSITY * level;
+				candleLight.position.set(lightHome.x + sway * 0.008, lightHome.y, lightHome.z + sway * 0.005);
+				waxMaterial.emissiveIntensity = 0.25 * level;
+				cutMaterial.emissiveIntensity = 0.45 * level;
 				emberMaterial.emissiveIntensity = 3 * ember;
 				flameMaterial.uniforms.uTime.value = t;
 				flameMaterial.uniforms.uSway.value = sway;
 				flame.visible = glow.visible = lit > 0.01;
 				flame.scale.set(lit, (0.85 + 0.25 * level) * lit, lit);
-				glow.material.opacity = 0.5 * level * Math.min(1, settings.brightness);
+				glow.material.opacity = 0.5 * level;
 
 				// Turn the flame to face the camera, staying upright.
 				flame.getWorldPosition(flameWorld);
-				flame.rotation.y =
-					Math.atan2(camera.position.x - flameWorld.x, camera.position.z - flameWorld.z) - pumpkin.rotation.y;
+				flame.rotation.y = Math.atan2(camera.position.x - flameWorld.x, camera.position.z - flameWorld.z) - pumpkin.rotation.y;
+
+				stepPhysics(dt);
+				updateProps(dt, t);
+				updateSurroundings(dt, t);
+				updateSweep(dt);
+				controls.update();
+
+				// Cutaway follows the camera; wireframes only draw when it's close.
+				cutaway.center.value.copy(camera.position);
+				const near = camera.position.distanceTo(pumpkinCenter) < pumpkinReach;
+				wires.forEach((wire) => (wire.visible = near));
+				// Keep the near plane tight inside the pumpkin, looser outside.
+				camera.near = clamp(camera.position.distanceTo(controls.target) * 0.02, 0.004, 0.05);
+				camera.updateProjectionMatrix();
 
 				starMaterial.uniforms.uTime.value = t;
-				controls.update();
 				renderer.render(scene, camera);
 			}
 
@@ -1614,20 +4032,13 @@
 				const aspect = width / height;
 				camera.aspect = aspect;
 				// On tall screens, widen the vertical view so the pumpkin still fits.
-				camera.fov = aspect < 1 ? Math.min(75, THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(20)) / aspect))) : 40;
+				camera.fov = aspect < 1 ? Math.min(75, THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(19)) / aspect))) : 38;
 				camera.updateProjectionMatrix();
 				renderer.setSize(width, height, false);
+				// Smoke particles size themselves in world units.
+				pointScale.value = (height * renderer.getPixelRatio()) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
 			}
 
-			// =====================================================================
-			// Start
-			// =====================================================================
-
-			rollShape();
-			buildPumpkin();
-			syncPanel();
-			applyToggles();
-			saveToURL();
 			addEventListener("resize", resize);
 			resize();
 			renderer.setAnimationLoop(animate);
