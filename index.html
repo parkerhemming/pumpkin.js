@@ -22,7 +22,6 @@
 
 			// =====================================================================
 			// Seeded randomness
-			// The seed lives in the URL (#12345), so a pumpkin can be recreated.
 			// =====================================================================
 
 			function mulberry32(a) {
@@ -34,13 +33,10 @@
 				};
 			}
 
-			const seed =
-				parseInt(location.hash.slice(1)) || Math.floor(Math.random() * 1e9);
-			history.replaceState(null, "", `#${seed}`);
-
-			let rand = mulberry32(seed);
+			let rand = mulberry32(1);
 			const random = (min, max) => min + rand() * (max - min);
 			const randInt = (min, max) => Math.floor(random(min, max + 1));
+			const randomSeed = () => Math.floor(Math.random() * 1e9) + 1;
 
 			// Smooth 2D value noise for textures and warping.
 			// `period` makes it wrap in x, for textures that go all the way around.
@@ -75,7 +71,7 @@
 				const canvas = document.createElement("canvas");
 				canvas.width = width;
 				canvas.height = height;
-				return [canvas, canvas.getContext("2d")];
+				return [canvas, canvas.getContext("2d", { willReadFrequently: true })];
 			}
 
 			// Fills a canvas pixel by pixel. paint(x, y) returns [r, g, b].
@@ -99,6 +95,33 @@
 				texture.colorSpace = THREE.SRGBColorSpace;
 				texture.anisotropy = 8;
 				return texture;
+			}
+
+			// =====================================================================
+			// Settings
+			// The URL keeps the seed and face (#seed=777&face=spooky), so a pumpkin
+			// can be shared or recreated. Width and height come from the seed until
+			// a slider changes them.
+			// =====================================================================
+
+			const FACE_NAMES = ["classic", "goofy", "spooky", "surprised"];
+			const hashParams = new URLSearchParams(location.hash.slice(1));
+
+			const settings = {
+				seed: parseInt(hashParams.get("seed") ?? location.hash.slice(1)) || randomSeed(),
+				face: FACE_NAMES.includes(hashParams.get("face")) ? hashParams.get("face") : "classic",
+				width: 1,
+				height: 0.73,
+				grooves: 1,
+				brightness: 1,
+				candleLit: true,
+				lidOff: false,
+				autoRotate: true,
+				wireframe: false,
+			};
+
+			function saveToURL() {
+				history.replaceState(null, "", `#seed=${settings.seed}&face=${settings.face}`);
 			}
 
 			// =====================================================================
@@ -136,10 +159,7 @@
 			controls.minDistance = 1.9;
 			controls.maxDistance = 9;
 			controls.maxPolarAngle = Math.PI * 0.48; // stay above the tabletop
-			controls.autoRotate = true;
 			controls.autoRotateSpeed = 0.5;
-			// ponytail: auto-rotate stops for good on first drag; phase 2 adds a toggle.
-			controls.addEventListener("start", () => (controls.autoRotate = false));
 
 			// =====================================================================
 			// Pumpkin shape
@@ -148,31 +168,50 @@
 			// from surfacePoint(u, v).
 			// =====================================================================
 
-			const W = random(0.95, 1.1); // half-width
-			const H = random(0.66, 0.8); // half-height
 			const SHELL = 0.07; // wall thickness
 
-			// Randomized ribs: the same Gaussian dents as the 2D version, now all
-			// the way around, and each groove drifts a little as it goes down.
-			const ribCount = randInt(9, 12);
-			const ribs = Array.from({ length: ribCount }, (_, i) => ({
-				angle: (i / ribCount) * TAU + random(-0.12, 0.12),
-				depth: random(0.035, 0.075),
-				width: random(0.1, 0.17),
-				wander: random(-0.1, 0.1),
-				phase: random(0, TAU),
-			}));
+			// Rolled from the seed by rollShape().
+			let ribs, lumps, topDimple, bottomDimple, lidV, lidTeeth, lidJag, lidTilt, COLS, faceV, turn, noise;
 
-			// Slow lumps so no two sides match.
-			const lumps = Array.from({ length: 4 }, () => ({
-				m: randInt(1, 3),
-				n: randInt(1, 3),
-				amp: random(0.008, 0.022),
-				phase: random(0, TAU),
-			}));
+			function rollShape() {
+				rand = mulberry32(settings.seed);
+				settings.width = random(0.95, 1.1);
+				settings.height = random(0.66, 0.8);
 
-			const topDimple = random(0.13, 0.2);
-			const bottomDimple = random(0.05, 0.1);
+				// Randomized ribs: the same Gaussian dents as the 2D version, now all
+				// the way around, and each groove drifts a little as it goes down.
+				const ribCount = randInt(9, 12);
+				ribs = Array.from({ length: ribCount }, (_, i) => ({
+					angle: (i / ribCount) * TAU + random(-0.12, 0.12),
+					depth: random(0.035, 0.075),
+					width: random(0.1, 0.17),
+					wander: random(-0.1, 0.1),
+					phase: random(0, TAU),
+				}));
+
+				// Slow lumps so no two sides match.
+				lumps = Array.from({ length: 4 }, () => ({
+					m: randInt(1, 3),
+					n: randInt(1, 3),
+					amp: random(0.008, 0.022),
+					phase: random(0, TAU),
+				}));
+
+				topDimple = random(0.13, 0.2);
+				bottomDimple = random(0.05, 0.1);
+
+				lidV = random(0.17, 0.2);
+				lidTeeth = randInt(5, 8);
+				lidJag = Array.from({ length: lidTeeth }, () => random(0.5, 1.4));
+				lidTilt = random(0, TAU);
+				// Columns land exactly on every zig-zag tip.
+				COLS = lidTeeth * 2 * Math.round(100 / lidTeeth);
+
+				faceV = random(0.44, 0.48);
+				turn = random(-0.15, 0.15);
+				noise = makeNoise();
+				skinDirty = true;
+			}
 
 			const wrapAngle = (a) => a - TAU * Math.round(a / TAU);
 
@@ -184,7 +223,7 @@
 					const distance = wrapAngle(theta - center) / rib.width;
 					groove += rib.depth * Math.exp(-0.5 * distance * distance);
 				}
-				return groove;
+				return groove * settings.grooves;
 			}
 
 			function surfacePoint(u, v, target = new THREE.Vector3()) {
@@ -203,6 +242,7 @@
 				r -= bottomDimple * Math.exp(-(((Math.PI - phi) / 0.35) ** 2));
 
 				// Squash the bottom so it sits flat on the table.
+				const { width: W, height: H } = settings;
 				let y = Math.cos(phi) * r * H;
 				const floor = -0.8 * H;
 				if (y < floor) y = floor - (floor - y) / (1 + (floor - y) / 0.05);
@@ -229,11 +269,6 @@
 			}
 
 			// Zig-zag knife line around the stem where the lid comes off.
-			const lidV = random(0.17, 0.2);
-			const lidTeeth = randInt(5, 8);
-			const lidJag = Array.from({ length: lidTeeth }, () => random(0.5, 1.4));
-			const lidTilt = random(0, TAU);
-
 			function lidCut(u) {
 				const x = u * lidTeeth;
 				const zig = 1 - Math.abs(2 * (x - Math.floor(x)) - 1);
@@ -241,17 +276,14 @@
 				return lidV + 0.03 * (zig * tooth - 0.5) + 0.012 * Math.sin(TAU * u + lidTilt);
 			}
 
-			// Columns land exactly on every zig-zag tip.
-			const COLS = lidTeeth * 2 * Math.round(100 / lidTeeth);
-
 			// =====================================================================
-			// Carving
-			// Face shapes are drawn in "face units": x right, y down, about the size
-			// of the pumpkin, centered on its front. toUV wraps them onto the surface.
+			// Faces
+			// Shapes are drawn in "face units": x right, y down, about the size of
+			// the pumpkin, centered on its front. toUV wraps them onto the surface.
+			// Keep everything between y = -0.36 and 0.4 so it stays below the lid.
 			// =====================================================================
 
-			const faceV = random(0.44, 0.48);
-			const toUV = ([x, y]) => [0.5 + x / (TAU * W), faceV + y / (Math.PI * H)];
+			const toUV = ([x, y]) => [0.5 + x / (TAU * settings.width), faceV + y / (Math.PI * settings.height)];
 
 			function triangle(cx, cy, width, height, tilt) {
 				const c = Math.cos(tilt);
@@ -263,14 +295,30 @@
 				].map(([x, y]) => [cx + x * c - y * s, cy + x * s + y * c]);
 			}
 
-			// A crescent grin. Teeth are flat-topped bumps scaled to the mouth's
-			// local thickness, so they never close the mouth off.
-			function grin(cy, halfWidth, bow, thickness, tilt, topTeeth, bottomTeeth) {
+			// An ellipse with a slightly lumpy edge.
+			function blob(cx, cy, rx, ry, tilt = 0) {
+				const c = Math.cos(tilt);
+				const s = Math.sin(tilt);
+				const lump = random(0, TAU);
+				return Array.from({ length: 48 }, (_, i) => {
+					const a = (i / 48) * TAU;
+					const k = 1 + 0.06 * Math.sin(3 * a + lump);
+					const x = Math.cos(a) * rx * k;
+					const y = Math.sin(a) * ry * k;
+					return [cx + x * c - y * s, cy + x * s + y * c];
+				});
+			}
+
+			// A crescent: a grin, a frown, or (thin and arched) an eyebrow.
+			// Teeth are bumps scaled to the mouth's local thickness: flat-topped,
+			// or pointed with `sharp: true`.
+			function grin(cy, halfWidth, bow, thickness, tilt, topTeeth = [], bottomTeeth = []) {
 				const thick = (x) => thickness * Math.pow(Math.max(0, 1 - (x / halfWidth) ** 2), 0.6);
 				const teeth = (x, list) =>
 					list.reduce((sum, t) => {
-						const edge = (t.w / 2 + 0.012 - Math.abs(x - t.x)) / 0.012;
-						return sum + t.h * thick(t.x) * Math.min(1, Math.max(0, edge));
+						const d = Math.abs(x - t.x);
+						const shape = t.sharp ? 1 - d / (t.w / 2) : (t.w / 2 + 0.012 - d) / 0.012;
+						return sum + t.h * thick(t.x) * Math.min(1, Math.max(0, shape));
 					}, 0);
 
 				const top = [];
@@ -278,43 +326,136 @@
 				for (let k = 0; k <= 80; k++) {
 					const x = halfWidth * (k / 40 - 1);
 					const mid = cy + bow * (1 - (x / halfWidth) ** 2) + tilt * x;
-					top.push([x, mid - thick(x) * 0.4 + teeth(x, topTeeth)]);
-					bottom.push([x, mid + thick(x) * 0.6 - teeth(x, bottomTeeth)]);
+					const topY = mid - thick(x) * 0.4 + teeth(x, topTeeth);
+					const bottomY = mid + thick(x) * 0.6 - teeth(x, bottomTeeth);
+					top.push([x, topY]);
+					// Never let teeth close the mouth off.
+					bottom.push([x, Math.max(bottomY, topY + Math.min(0.015, thick(x) * 0.3))]);
 				}
 				return [...top, ...bottom.reverse().slice(1, -1)];
 			}
 
-			function classicFace() {
-				const eyeY = random(-0.24, -0.18);
-				const gap = random(0.26, 0.32);
-				const size = random(0.2, 0.25);
-				const eye = (side) =>
-					triangle(
-						side * gap + random(-0.03, 0.03),
-						eyeY + random(-0.03, 0.03),
-						size * random(0.85, 1.15),
-						size * random(0.8, 1.1),
-						random(-0.2, 0.2),
-					);
+			const FACES = {
+				classic() {
+					const eyeY = random(-0.24, -0.18);
+					const gap = random(0.26, 0.32);
+					const size = random(0.2, 0.25);
+					const eye = (side) =>
+						triangle(
+							side * gap + random(-0.03, 0.03),
+							eyeY + random(-0.03, 0.03),
+							size * random(0.85, 1.15),
+							size * random(0.8, 1.1),
+							random(-0.2, 0.2),
+						);
+					const mouthHalf = random(0.36, 0.46);
+					const tooth = (x) => ({ x: x * mouthHalf, w: random(0.07, 0.1), h: random(0.45, 0.6) });
 
-				const mouthHalf = random(0.36, 0.46);
-				const tooth = (x) => ({ x: x * mouthHalf, w: random(0.07, 0.1), h: random(0.45, 0.6) });
+					return [
+						eye(-1),
+						eye(1),
+						triangle(random(-0.03, 0.03), random(-0.02, 0.02), random(0.09, 0.12), random(0.08, 0.11), random(-0.15, 0.15)),
+						grin(
+							random(0.17, 0.21),
+							mouthHalf,
+							random(0.05, 0.09),
+							random(0.14, 0.18),
+							random(-0.08, 0.08),
+							[tooth(random(-0.25, 0.15))],
+							[tooth(random(-0.6, -0.4)), tooth(random(0.35, 0.55))],
+						),
+					];
+				},
 
-				return [
-					eye(-1),
-					eye(1),
-					triangle(random(-0.03, 0.03), random(-0.02, 0.02), random(0.09, 0.12), random(0.08, 0.11), random(-0.15, 0.15)),
-					grin(
-						random(0.17, 0.21),
-						mouthHalf,
-						random(0.05, 0.09),
-						random(0.14, 0.18),
-						random(-0.08, 0.08),
-						[tooth(random(-0.25, 0.15))],
-						[tooth(random(-0.6, -0.4)), tooth(random(0.35, 0.55))],
-					),
-				];
-			}
+				// Mismatched round eyes, a blob nose, a lopsided grin with a buck tooth.
+				goofy() {
+					const big = random(0.11, 0.14);
+					const small = big * random(0.55, 0.7);
+					const side = rand() < 0.5 ? -1 : 1; // which eye is the big one
+
+					return [
+						blob(side * random(0.28, 0.32), random(-0.22, -0.18), big, big * random(0.9, 1.15), random(-0.3, 0.3)),
+						blob(-side * random(0.25, 0.3), random(-0.26, -0.21), small, small * random(0.8, 1.1), random(-0.3, 0.3)),
+						blob(random(-0.06, 0.06), random(-0.02, 0.02), random(0.04, 0.06), random(0.035, 0.05)),
+						grin(
+							random(0.16, 0.2),
+							random(0.38, 0.46),
+							random(0.08, 0.12),
+							random(0.17, 0.21),
+							random(-0.15, 0.15),
+							[{ x: random(-0.06, 0.06), w: random(0.1, 0.13), h: 0.6 }],
+							rand() < 0.5 ? [] : [{ x: side * random(0.2, 0.3), w: 0.07, h: 0.45 }],
+						),
+					];
+				},
+
+				// Slanted angry eyes, a slit nose, a jagged mouth full of fangs.
+				spooky() {
+					const eyeY = random(-0.24, -0.19);
+					const gap = random(0.25, 0.3);
+					const w = random(0.22, 0.27);
+					const h = random(0.15, 0.19);
+					const eye = (side) => {
+						const slant = random(0.07, 0.11); // brows angle down toward the nose
+						const cx = side * (gap + random(-0.02, 0.02));
+						const cy = eyeY + random(-0.02, 0.02);
+						// Local x points toward the nose.
+						return [
+							[-w / 2, -h / 2],
+							[w / 2, -h / 2 + slant],
+							[w * 0.15, h / 2],
+						].map(([x, y]) => [cx - side * x, cy + y]);
+					};
+
+					const mouthHalf = random(0.4, 0.48);
+					const n = randInt(4, 5);
+					const toothW = (1.5 * mouthHalf) / n;
+					const start = -0.75 * mouthHalf;
+					const fangs = (count, offset, min, max) =>
+						Array.from({ length: count }, (_, i) => ({
+							x: start + toothW * (i + offset),
+							w: toothW,
+							h: random(min, max),
+							sharp: true,
+						}));
+
+					return [
+						eye(-1),
+						eye(1),
+						triangle(random(-0.02, 0.02), random(-0.02, 0.02), random(0.06, 0.08), random(0.12, 0.15), random(-0.1, 0.1)),
+						grin(
+							random(0.2, 0.24),
+							mouthHalf,
+							random(-0.04, 0.02),
+							random(0.17, 0.21),
+							random(-0.05, 0.05),
+							fangs(n, 0.5, 0.6, 0.75),
+							fangs(n - 1, 1, 0.55, 0.7),
+						),
+					];
+				},
+
+				// Wide round eyes under raised brows, and a little "O" mouth.
+				surprised() {
+					const eyeY = random(-0.17, -0.14);
+					const gap = random(0.25, 0.3);
+					const eye = (side) =>
+						blob(side * gap + random(-0.02, 0.02), eyeY + random(-0.02, 0.02), random(0.08, 0.1), random(0.1, 0.12), random(-0.2, 0.2));
+					const brow = (side) =>
+						grin(eyeY - 0.17 + random(-0.015, 0.01), random(0.08, 0.1), random(-0.04, -0.025), 0.035, side * random(0, 0.15)).map(
+							([x, y]) => [x + side * gap, y],
+						);
+
+					return [
+						eye(-1),
+						eye(1),
+						brow(-1),
+						brow(1),
+						triangle(random(-0.02, 0.02), random(0.0, 0.03), random(0.06, 0.08), random(0.06, 0.08), random(-0.15, 0.15)),
+						blob(random(-0.03, 0.03), random(0.21, 0.24), random(0.07, 0.09), random(0.1, 0.13), random(-0.15, 0.15)),
+					];
+				},
+			};
 
 			function densify(poly, step) {
 				const out = [];
@@ -356,25 +497,26 @@
 				return area > 0 ? poly : poly.reverse();
 			}
 
-			const holes = classicFace().map((shape) =>
-				orient(wobble(densify(shape, 0.012), 0.004).map(toUV)),
-			);
-
 			// The carving mask: white = pumpkin, black = hole. It cuts the shells
-			// (via alphaMap) and tells buildSurface which grid cells to drop.
+			// (via alphaMap) and tells buildShell which grid cells to drop.
 			const MASK_W = 2048;
 			const MASK_H = 1024;
 			const [maskCanvas, maskCtx] = makeCanvas(MASK_W, MASK_H);
-			maskCtx.fillStyle = "#fff";
-			maskCtx.fillRect(0, 0, MASK_W, MASK_H);
-			maskCtx.fillStyle = "#000";
-			for (const hole of holes) {
-				maskCtx.beginPath();
-				for (const [u, v] of hole) maskCtx.lineTo(u * MASK_W, v * MASK_H);
-				maskCtx.fill();
-			}
-			const maskPixels = maskCtx.getImageData(0, 0, MASK_W, MASK_H).data;
 			const maskTexture = new THREE.CanvasTexture(maskCanvas);
+			let maskPixels;
+
+			function drawMask(holes) {
+				maskCtx.fillStyle = "#fff";
+				maskCtx.fillRect(0, 0, MASK_W, MASK_H);
+				maskCtx.fillStyle = "#000";
+				for (const hole of holes) {
+					maskCtx.beginPath();
+					for (const [u, v] of hole) maskCtx.lineTo(u * MASK_W, v * MASK_H);
+					maskCtx.fill();
+				}
+				maskPixels = maskCtx.getImageData(0, 0, MASK_W, MASK_H).data;
+				maskTexture.needsUpdate = true;
+			}
 
 			function isHole(u, v) {
 				const x = Math.min(MASK_W - 1, Math.floor(u * MASK_W));
@@ -386,15 +528,18 @@
 			// Shell geometry
 			// =====================================================================
 
-			// One patch of skin. vRange(u) gives [vStart, vEnd] for each column,
-			// so the lid and body share the zig-zag cut line exactly.
-			// inner = true builds the inside wall, offset inward and facing in.
-			function buildSurface(rows, vRange, inner) {
-				const positions = [];
-				const normals = [];
+			// One patch of shell, returned as [skin, flesh] geometries on the same
+			// grid. vRange(u) gives [vStart, vEnd] for each column, so the lid and
+			// body share the zig-zag cut line exactly.
+			function buildShell(rows, vRange) {
+				const outer = [];
+				const inner = [];
+				const outerNormals = [];
+				const innerNormals = [];
 				const uvs = [];
 				const vGrid = [];
-				const index = [];
+				const outerIndex = [];
+				const innerIndex = [];
 				const p = new THREE.Vector3();
 				const n = new THREE.Vector3();
 				const id = (i, j) => i * (rows + 1) + j;
@@ -406,12 +551,11 @@
 						const v = v0 + ((v1 - v0) * j) / rows;
 						surfacePoint(u, v, p);
 						surfaceNormal(u, v, n);
-						if (inner) {
-							p.addScaledVector(n, -SHELL);
-							n.negate();
-						}
-						positions.push(p.x, p.y, p.z);
-						normals.push(n.x, n.y, n.z);
+						outer.push(p.x, p.y, p.z);
+						outerNormals.push(n.x, n.y, n.z);
+						p.addScaledVector(n, -SHELL);
+						inner.push(p.x, p.y, p.z);
+						innerNormals.push(-n.x, -n.y, -n.z);
 						uvs.push(u, 1 - v);
 						vGrid.push(v);
 					}
@@ -437,17 +581,20 @@
 						const b = id(i + 1, j);
 						const c = id(i, j + 1);
 						const d = id(i + 1, j + 1);
-						if (inner) index.push(a, b, c, b, d, c);
-						else index.push(a, c, b, b, c, d);
+						outerIndex.push(a, c, b, b, c, d);
+						innerIndex.push(a, b, c, b, d, c); // inside faces point inward
 					}
 				}
 
-				const geometry = new THREE.BufferGeometry();
-				geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-				geometry.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
-				geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
-				geometry.setIndex(index);
-				return geometry;
+				const geometry = (positions, normals, index) => {
+					const g = new THREE.BufferGeometry();
+					g.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+					g.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+					g.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+					g.setIndex(index);
+					return g;
+				};
+				return [geometry(outer, outerNormals, outerIndex), geometry(inner, innerNormals, innerIndex)];
 			}
 
 			// The cut walls: for each closed loop of (u, v) points, a strip joining
@@ -485,16 +632,16 @@
 			// Pumpkin textures
 			// =====================================================================
 
-			const noise = makeNoise();
+			const SKIN_W = 1024;
+			const SKIN_H = 512;
+			const [skinCanvas, skinCtx] = makeCanvas(SKIN_W, SKIN_H);
+			const skinTexture = colorTexture(skinCanvas);
+			let skinDirty = true; // repaint when the seed or groove depth changes
 
-			function skinTexture() {
-				const width = 1024;
-				const height = 512;
-				const [canvas, ctx] = makeCanvas(width, height);
-
-				paintPixels(ctx, width, height, (x, y) => {
-					const u = (x + 0.5) / width;
-					const v = (y + 0.5) / height;
+			function paintSkin() {
+				paintPixels(skinCtx, SKIN_W, SKIN_H, (x, y) => {
+					const u = (x + 0.5) / SKIN_W;
+					const v = (y + 0.5) / SKIN_H;
 					const groove = Math.min(1, grooveAt(TAU * (u - 0.5), Math.PI * v) / 0.05);
 					const streak = noise(u * 220, v * 6, 220);
 					const blotch = noise(u * 10, v * 5, 10);
@@ -509,30 +656,32 @@
 
 				// Specks and scuffs.
 				for (let i = 0; i < 400; i++) {
-					ctx.fillStyle = `rgba(${randInt(90, 140)}, 55, 10, ${random(0.15, 0.4)})`;
-					ctx.fillRect(random(0, width), random(0, height), random(1, 3), random(1, 2.5));
+					skinCtx.fillStyle = `rgba(${randInt(90, 140)}, 55, 10, ${random(0.15, 0.4)})`;
+					skinCtx.fillRect(random(0, SKIN_W), random(0, SKIN_H), random(1, 3), random(1, 2.5));
 				}
 
 				// The knife line around the lid.
-				ctx.strokeStyle = "rgba(60, 22, 4, 0.8)";
-				ctx.lineWidth = 2.5;
-				ctx.beginPath();
-				for (let i = 0; i <= COLS; i++) ctx.lineTo((i / COLS) * width, lidCut(i / COLS) * height);
-				ctx.stroke();
+				skinCtx.strokeStyle = "rgba(60, 22, 4, 0.8)";
+				skinCtx.lineWidth = 2.5;
+				skinCtx.beginPath();
+				for (let i = 0; i <= COLS; i++) skinCtx.lineTo((i / COLS) * SKIN_W, lidCut(i / COLS) * SKIN_H);
+				skinCtx.stroke();
 
-				return colorTexture(canvas);
+				skinTexture.needsUpdate = true;
+				skinDirty = false;
 			}
 
 			function fleshTexture() {
 				const width = 512;
 				const height = 256;
 				const [canvas, ctx] = makeCanvas(width, height);
+				const fleshNoise = makeNoise();
 
 				paintPixels(ctx, width, height, (x, y) => {
 					const u = x / width;
 					const v = y / height;
-					const fiber = noise(u * 120, v * 10 + 50, 120);
-					const blotch = noise(u * 8, v * 4 + 80, 8);
+					const fiber = fleshNoise(u * 120, v * 10, 120);
+					const blotch = fleshNoise(u * 8, v * 4 + 80, 8);
 					return [240 - 25 * fiber, 165 + 30 * blotch - 25 * fiber, 50 + 20 * blotch];
 				});
 
@@ -540,11 +689,11 @@
 			}
 
 			// =====================================================================
-			// Build the pumpkin
+			// Materials
 			// =====================================================================
 
 			const skinMaterial = new THREE.MeshStandardMaterial({
-				map: skinTexture(),
+				map: skinTexture,
 				alphaMap: maskTexture,
 				alphaTest: 0.5,
 				roughness: 0.55,
@@ -556,39 +705,20 @@
 				roughness: 0.9,
 			});
 			const cutMaterial = new THREE.MeshStandardMaterial({ color: "#f2b860", roughness: 0.8 });
+			const stemMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85 });
+			const tendrilMaterial = new THREE.MeshStandardMaterial({ color: "#6f7a32", roughness: 0.7 });
+			// The faint emissive fakes light glowing through the wax.
+			const waxMaterial = new THREE.MeshStandardMaterial({
+				color: "#efe0bf",
+				roughness: 0.5,
+				emissive: "#ff8a3a",
+				emissiveIntensity: 0.2,
+			});
+			const wickMaterial = new THREE.MeshStandardMaterial({ color: "#1b130d", roughness: 1 });
+			const emberMaterial = new THREE.MeshStandardMaterial({ color: "#000", emissive: "#ff6a20", emissiveIntensity: 3 });
 
-			function shellMesh(geometry, material) {
-				const mesh = new THREE.Mesh(geometry, material);
-				mesh.castShadow = true;
-				mesh.receiveShadow = true;
-				return mesh;
-			}
-
-			const lidRing = Array.from({ length: COLS }, (_, i) => [i / COLS, lidCut(i / COLS)]);
-			const bodyRange = (u) => [lidCut(u), 1];
-			const lidRange = (u) => [0, lidCut(u)];
-
-			const pumpkin = new THREE.Group();
-			const lid = new THREE.Group();
-			const bodySkin = buildSurface(110, bodyRange, false);
-
-			pumpkin.add(
-				shellMesh(bodySkin, skinMaterial),
-				shellMesh(buildSurface(110, bodyRange, true), fleshMaterial),
-				shellMesh(buildRim([[...lidRing].reverse(), ...holes]), cutMaterial),
-				lid,
-			);
-			lid.add(
-				shellMesh(buildSurface(24, lidRange, false), skinMaterial),
-				shellMesh(buildSurface(24, lidRange, true), fleshMaterial),
-				shellMesh(buildRim([lidRing]), cutMaterial),
-			);
-
-			bodySkin.computeBoundingBox();
-			pumpkin.position.y = -bodySkin.boundingBox.min.y;
-			pumpkin.rotation.y = random(-0.15, 0.15);
-			scene.add(pumpkin);
-			controls.target.set(0, pumpkin.position.y * 0.85, 0);
+			// The ones the wireframe toggle switches.
+			const pumpkinMaterials = [skinMaterial, fleshMaterial, cutMaterial, stemMaterial, tendrilMaterial, waxMaterial];
 
 			// =====================================================================
 			// Stem and tendrils
@@ -717,111 +847,11 @@
 				return new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 160, 0.008, 6, false);
 			}
 
-			const stem = new THREE.Mesh(
-				buildStem(),
-				new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85 }),
-			);
-			stem.castShadow = true;
-			lid.add(stem);
-
-			const tendrilMaterial = new THREE.MeshStandardMaterial({ color: "#6f7a32", roughness: 0.7 });
-			const firstTendril = random(0, TAU);
-			for (let i = 0, count = randInt(2, 3); i < count; i++) {
-				const tendril = new THREE.Mesh(
-					buildTendril(firstTendril + (i * TAU) / count + random(-0.5, 0.5)),
-					tendrilMaterial,
-				);
-				tendril.castShadow = true;
-				lid.add(tendril);
-			}
-
 			// =====================================================================
 			// Candle
-			// The flame sits between the eyes and nose, so light pours out through
-			// the mouth and down onto the table.
+			// The flame, its glow and the light live for the whole session;
+			// buildCandle() makes new wax for each pumpkin and moves them onto it.
 			// =====================================================================
-
-			const floorY = surfacePoint(0, 1).y + SHELL;
-			const flameY = surfacePoint(0.5, faceV - 0.07).y;
-			const candleRadius = random(0.1, 0.13);
-			const candleHeight = flameY - 0.08 - floorY;
-
-			const candle = new THREE.Group();
-			candle.position.set(random(-0.05, 0.05), floorY - 0.01, random(-0.05, 0.05));
-			pumpkin.add(candle);
-
-			// The faint emissive fakes light glowing through the wax.
-			const waxMaterial = new THREE.MeshStandardMaterial({
-				color: "#efe0bf",
-				roughness: 0.5,
-				emissive: "#ff8a3a",
-				emissiveIntensity: 0.2,
-			});
-
-			// Body: a lathe with a melted pool on top, then pushed out of round.
-			const wax = new THREE.LatheGeometry(
-				[
-					[0.001, 0],
-					[candleRadius * 1.02, 0],
-					[candleRadius, 0.02],
-					[candleRadius * 0.99, candleHeight * 0.6],
-					[candleRadius * 1.01, candleHeight - 0.025],
-					[candleRadius * 0.95, candleHeight],
-					[candleRadius * 0.75, candleHeight - 0.008],
-					[0.001, candleHeight - 0.02],
-				].map(([r, y]) => new THREE.Vector2(r, y)),
-				40,
-			);
-			const waxPhase = random(0, TAU);
-			const waxPositions = wax.attributes.position;
-			for (let i = 0; i < waxPositions.count; i++) {
-				const x = waxPositions.getX(i);
-				const y = waxPositions.getY(i);
-				const z = waxPositions.getZ(i);
-				const a = Math.atan2(z, x);
-				const k = 1 + 0.03 * Math.sin(3 * a + y * 8 + waxPhase) + 0.015 * Math.sin(7 * a + waxPhase);
-				waxPositions.setXYZ(i, x * k, y, z * k);
-			}
-			wax.computeVertexNormals();
-
-			const candleBody = new THREE.Mesh(wax, waxMaterial);
-			candleBody.castShadow = true;
-			candleBody.receiveShadow = true;
-			candle.add(candleBody);
-
-			for (let i = 0, count = randInt(3, 5); i < count; i++) {
-				const length = random(0.04, 0.14);
-				const a = random(0, TAU);
-				const drip = new THREE.Mesh(new THREE.CapsuleGeometry(random(0.012, 0.02), length, 4, 8), waxMaterial);
-				drip.position.set(Math.cos(a) * candleRadius, candleHeight - 0.02 - length / 2, Math.sin(a) * candleRadius);
-				drip.rotation.y = -a;
-				drip.scale.x = 0.6; // flatten against the candle
-				candle.add(drip);
-			}
-
-			const wickTop = new THREE.Vector3(random(-0.008, 0.008), candleHeight + 0.03, random(-0.008, 0.008));
-			candle.add(
-				new THREE.Mesh(
-					new THREE.TubeGeometry(
-						new THREE.QuadraticBezierCurve3(
-							new THREE.Vector3(0, candleHeight - 0.03, 0),
-							new THREE.Vector3(0, candleHeight + 0.015, 0),
-							wickTop,
-						),
-						8,
-						0.0045,
-						6,
-					),
-					new THREE.MeshStandardMaterial({ color: "#1b130d", roughness: 1 }),
-				),
-			);
-
-			const ember = new THREE.Mesh(
-				new THREE.SphereGeometry(0.006, 8, 6),
-				new THREE.MeshStandardMaterial({ color: "#000", emissive: "#ff6a20", emissiveIntensity: 3 }),
-			);
-			ember.position.copy(wickTop);
-			candle.add(ember);
 
 			// The flame: a camera-facing teardrop drawn by a small shader.
 			const flameMaterial = new THREE.ShaderMaterial({
@@ -863,8 +893,6 @@
 			const flameGeometry = new THREE.PlaneGeometry(0.065, 0.19);
 			flameGeometry.translate(0, 0.095, 0);
 			const flame = new THREE.Mesh(flameGeometry, flameMaterial);
-			flame.position.copy(wickTop).y -= 0.025;
-			candle.add(flame);
 
 			// A soft halo, seen only through the carving.
 			const [glowCanvas, glowCtx] = makeCanvas(128, 128);
@@ -883,20 +911,177 @@
 					opacity: 0.5,
 				}),
 			);
-			glow.position.copy(wickTop).y += 0.06;
 			glow.scale.setScalar(0.7);
-			candle.add(glow);
 
 			const CANDLE_INTENSITY = 4;
 			const candleLight = new THREE.PointLight("#ffa850", CANDLE_INTENSITY, 0, 1.5);
-			const lightHome = wickTop.clone().setY(wickTop.y + 0.05);
-			candleLight.position.copy(lightHome);
 			candleLight.castShadow = true;
 			candleLight.shadow.mapSize.set(1024, 1024);
 			candleLight.shadow.camera.near = 0.03;
 			candleLight.shadow.camera.far = 12;
 			candleLight.shadow.bias = -0.003;
-			candle.add(candleLight);
+			const lightHome = new THREE.Vector3(); // where the light rests, before it sways
+
+			// The flame sits between the eyes and nose, so light pours out through
+			// the mouth and down onto the table.
+			function buildCandle() {
+				const floorY = surfacePoint(0, 1).y + SHELL;
+				const flameY = surfacePoint(0.5, faceV - 0.07).y;
+				const radius = random(0.1, 0.13);
+				const height = flameY - 0.08 - floorY;
+
+				const candle = new THREE.Group();
+				candle.position.set(random(-0.05, 0.05), floorY - 0.01, random(-0.05, 0.05));
+
+				// Body: a lathe with a melted pool on top, then pushed out of round.
+				const wax = new THREE.LatheGeometry(
+					[
+						[0.001, 0],
+						[radius * 1.02, 0],
+						[radius, 0.02],
+						[radius * 0.99, height * 0.6],
+						[radius * 1.01, height - 0.025],
+						[radius * 0.95, height],
+						[radius * 0.75, height - 0.008],
+						[0.001, height - 0.02],
+					].map(([r, y]) => new THREE.Vector2(r, y)),
+					40,
+				);
+				const phase = random(0, TAU);
+				const position = wax.attributes.position;
+				for (let i = 0; i < position.count; i++) {
+					const x = position.getX(i);
+					const y = position.getY(i);
+					const z = position.getZ(i);
+					const a = Math.atan2(z, x);
+					const k = 1 + 0.03 * Math.sin(3 * a + y * 8 + phase) + 0.015 * Math.sin(7 * a + phase);
+					position.setXYZ(i, x * k, y, z * k);
+				}
+				wax.computeVertexNormals();
+
+				const body = new THREE.Mesh(wax, waxMaterial);
+				body.castShadow = true;
+				body.receiveShadow = true;
+				candle.add(body);
+
+				for (let i = 0, count = randInt(3, 5); i < count; i++) {
+					const length = random(0.04, 0.14);
+					const a = random(0, TAU);
+					const drip = new THREE.Mesh(new THREE.CapsuleGeometry(random(0.012, 0.02), length, 4, 8), waxMaterial);
+					drip.position.set(Math.cos(a) * radius, height - 0.02 - length / 2, Math.sin(a) * radius);
+					drip.rotation.y = -a;
+					drip.scale.x = 0.6; // flatten against the candle
+					candle.add(drip);
+				}
+
+				const wickTop = new THREE.Vector3(random(-0.008, 0.008), height + 0.03, random(-0.008, 0.008));
+				const wick = new THREE.QuadraticBezierCurve3(
+					new THREE.Vector3(0, height - 0.03, 0),
+					new THREE.Vector3(0, height + 0.015, 0),
+					wickTop,
+				);
+				candle.add(new THREE.Mesh(new THREE.TubeGeometry(wick, 8, 0.0045, 6), wickMaterial));
+
+				const ember = new THREE.Mesh(new THREE.SphereGeometry(0.006, 8, 6), emberMaterial);
+				ember.position.copy(wickTop);
+
+				flame.position.copy(wickTop).y -= 0.025;
+				glow.position.copy(wickTop).y += 0.06;
+				lightHome.copy(wickTop).y += 0.05;
+				candleLight.position.copy(lightHome);
+				candle.add(ember, flame, glow, candleLight);
+				return candle;
+			}
+
+			// =====================================================================
+			// Build the pumpkin
+			// Runs on load, for a new seed or face, and when a shape slider moves.
+			// Each part draws from its own seeded stream, so moving a slider
+			// reshapes this pumpkin instead of rolling a new one.
+			// =====================================================================
+
+			let pumpkin = null;
+			// The lid swings around the middle of its cut. lidHome is where it sits
+			// on the pumpkin, lidRest is where it lands on the table.
+			let lidPivot = null;
+			const lidHome = new THREE.Vector3();
+			const lidRest = new THREE.Vector3();
+
+			function shellMesh(geometry, material) {
+				const mesh = new THREE.Mesh(geometry, material);
+				mesh.castShadow = true;
+				mesh.receiveShadow = true;
+				return mesh;
+			}
+
+			function buildPumpkin() {
+				if (skinDirty) {
+					rand = mulberry32(settings.seed + 3);
+					paintSkin();
+				}
+
+				rand = mulberry32(settings.seed + 1);
+				const holes = FACES[settings.face]().map((shape) =>
+					orient(wobble(densify(shape, 0.012), 0.004).map(toUV)),
+				);
+				drawMask(holes);
+
+				rand = mulberry32(settings.seed + 2);
+				const lidRing = Array.from({ length: COLS }, (_, i) => [i / COLS, lidCut(i / COLS)]);
+				const [bodySkin, bodyFlesh] = buildShell(110, (u) => [lidCut(u), 1]);
+				const [lidSkin, lidFlesh] = buildShell(24, (u) => [0, lidCut(u)]);
+
+				const lid = new THREE.Group();
+				lid.add(
+					shellMesh(lidSkin, skinMaterial),
+					shellMesh(lidFlesh, fleshMaterial),
+					shellMesh(buildRim([lidRing]), cutMaterial),
+				);
+
+				const stem = new THREE.Mesh(buildStem(), stemMaterial);
+				stem.castShadow = true;
+				lid.add(stem);
+
+				const firstTendril = random(0, TAU);
+				for (let i = 0, count = randInt(2, 3); i < count; i++) {
+					const tendril = new THREE.Mesh(buildTendril(firstTendril + (i * TAU) / count + random(-0.5, 0.5)), tendrilMaterial);
+					tendril.castShadow = true;
+					lid.add(tendril);
+				}
+
+				const ringPoints = lidRing.map(([u, v]) => surfacePoint(u, v));
+				const ringY = ringPoints.reduce((sum, p) => sum + p.y, 0) / ringPoints.length;
+				const ringBottom = Math.min(...ringPoints.map((p) => p.y)) - SHELL * 0.8; // inner edge sits a bit lower
+				const ringRadius = Math.max(...ringPoints.map((p) => Math.hypot(p.x, p.z)));
+				lid.position.y = -ringY;
+				lidPivot = new THREE.Group();
+				lidPivot.add(lid);
+
+				const group = new THREE.Group();
+				group.add(
+					shellMesh(bodySkin, skinMaterial),
+					shellMesh(bodyFlesh, fleshMaterial),
+					shellMesh(buildRim([[...lidRing].reverse(), ...holes]), cutMaterial),
+					lidPivot,
+					buildCandle(), // also moves the flame and light off the old pumpkin
+				);
+
+				bodySkin.computeBoundingBox();
+				group.position.y = -bodySkin.boundingBox.min.y;
+				group.rotation.y = turn;
+				lidHome.set(0, ringY, 0);
+				// Beside the pumpkin (on the side away from the panel), resting on its cut edge.
+				lidRest.set(-(settings.width + ringRadius + 0.2), ringY - ringBottom - group.position.y, 0.35);
+
+				if (pumpkin) {
+					scene.remove(pumpkin);
+					pumpkin.traverse((object) => object.geometry?.dispose());
+				}
+				pumpkin = group;
+				scene.add(pumpkin);
+				controls.target.set(0, pumpkin.position.y * 0.85, 0);
+				moon.shadow.needsUpdate = true;
+			}
 
 			// =====================================================================
 			// Table
@@ -926,7 +1111,10 @@
 					for (let x = 0; x < w; x++) {
 						const X = (x / w) * length;
 						const Z = (y / h) * width;
-						let rings = Z * (12 + 10 * woodNoise(X * 0.3 + offset, Z * 3)) + 3 * woodNoise(X * 0.4 + offset, offset) + 1.5 * woodNoise(X * 1.5 + offset, Z * 8);
+						let rings =
+							Z * (12 + 10 * woodNoise(X * 0.3 + offset, Z * 3)) +
+							3 * woodNoise(X * 0.4 + offset, offset) +
+							1.5 * woodNoise(X * 1.5 + offset, Z * 8);
 						let knot = 0;
 						for (const k of knots) {
 							const d2 = ((X - k.x) ** 2 + (Z - k.z) ** 2) / (k.r * k.r);
@@ -1159,30 +1347,194 @@
 			Object.assign(moon.shadow.camera, { left: -3.5, right: 3.5, top: 3.5, bottom: -3.5, near: 0.5, far: 20 });
 			moon.shadow.bias = -0.0005;
 			moon.shadow.normalBias = 0.02;
-			// Nothing in the moonlight moves, so render its shadow once.
-			// (Set needsUpdate again after rebuilding the pumpkin.)
+			// Nothing in the moonlight moves, so its shadow only renders when
+			// buildPumpkin() asks for it.
 			moon.shadow.autoUpdate = false;
-			moon.shadow.needsUpdate = true;
 			scene.add(moon);
 
 			// =====================================================================
-			// Hint
+			// Control panel
 			// =====================================================================
 
+			const style = document.createElement("style");
+			style.textContent = `
+				.panel {
+					position: fixed; top: 12px; right: 12px; width: 240px; max-width: calc(100vw - 24px);
+					box-sizing: border-box; padding: 10px 14px; border-radius: 10px;
+					background: rgba(14, 10, 8, 0.8); border: 1px solid rgba(255, 170, 90, 0.2);
+					color: #e8d8bf; font: 13px/1.3 system-ui, sans-serif; backdrop-filter: blur(6px);
+				}
+				.panel summary { cursor: pointer; font-weight: 600; color: #ffb366; }
+				.panel label { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 9px 0; }
+				.panel input[type="range"] { width: 120px; accent-color: #ff9a3c; }
+				.panel input[type="checkbox"] { width: 16px; height: 16px; accent-color: #ff9a3c; }
+				.panel input[type="number"], .panel select {
+					width: 120px; box-sizing: border-box; padding: 4px 6px; border-radius: 6px;
+					background: #1f1712; color: inherit; border: 1px solid #4a3626; font: inherit;
+				}
+				.panel button {
+					width: 100%; margin: 4px 0; padding: 7px 8px; border-radius: 6px; cursor: pointer;
+					background: #3a2616; color: inherit; border: 1px solid #6b4a2c; font: inherit;
+				}
+				.panel button:hover { background: #4d321c; }
+				.hint {
+					position: fixed; bottom: 14px; left: 0; right: 0; text-align: center; pointer-events: none;
+					color: #c9b9a0; font: 13px system-ui, sans-serif; opacity: 0.6;
+				}
+			`;
+			document.head.appendChild(style);
+
+			const panel = document.createElement("details");
+			panel.className = "panel";
+			panel.open = innerWidth > 600; // start folded on phones
+			panel.innerHTML = `
+				<summary>Pumpkin</summary>
+				<label>Seed <input id="seed" type="number" min="1" step="1" /></label>
+				<button id="newPumpkin">New pumpkin</button>
+				<label>Face
+					<select id="face">${FACE_NAMES.map((name) => `<option value="${name}">${name}</option>`).join("")}</select>
+				</label>
+				<label>Width <input id="width" type="range" min="0.8" max="1.25" step="0.01" /></label>
+				<label>Height <input id="height" type="range" min="0.6" max="0.95" step="0.01" /></label>
+				<label>Grooves <input id="grooves" type="range" min="0" max="2.5" step="0.05" /></label>
+				<label>Candle brightness <input id="brightness" type="range" min="0" max="2" step="0.05" /></label>
+				<label>Candle lit <input id="candleLit" type="checkbox" /></label>
+				<label>Lid off <input id="lidOff" type="checkbox" /></label>
+				<label>Auto-rotate <input id="autoRotate" type="checkbox" /></label>
+				<label>Wireframe <input id="wireframe" type="checkbox" /></label>
+				<button id="screenshot">Save screenshot</button>
+			`;
+			document.body.appendChild(panel);
+
 			const hint = document.createElement("div");
-			hint.textContent = `seed ${seed} · drag to turn · scroll or pinch to zoom`;
-			Object.assign(hint.style, {
-				position: "fixed",
-				bottom: "14px",
-				left: "0",
-				right: "0",
-				textAlign: "center",
-				color: "#c9b9a0",
-				font: "13px system-ui, sans-serif",
-				opacity: "0.6",
-				pointerEvents: "none",
-			});
+			hint.className = "hint";
+			hint.textContent = "drag to turn · scroll or pinch to zoom";
 			document.body.appendChild(hint);
+
+			// Every control's id matches its key in `settings`.
+			const ui = Object.fromEntries([...panel.querySelectorAll("[id]")].map((el) => [el.id, el]));
+
+			function syncPanel() {
+				for (const key of ["seed", "face", "width", "height", "grooves", "brightness"]) ui[key].value = settings[key];
+				for (const key of ["candleLit", "lidOff", "autoRotate", "wireframe"]) ui[key].checked = settings[key];
+			}
+
+			function applyToggles() {
+				controls.autoRotate = settings.autoRotate;
+				for (const material of pumpkinMaterials) material.wireframe = settings.wireframe;
+			}
+
+			// Slider drags fire many events; rebuild at most once per frame.
+			let rebuildQueued = false;
+			function queueRebuild() {
+				if (rebuildQueued) return;
+				rebuildQueued = true;
+				requestAnimationFrame(() => {
+					rebuildQueued = false;
+					buildPumpkin();
+				});
+			}
+
+			function newPumpkin(seed) {
+				settings.seed = seed;
+				rollShape();
+				buildPumpkin();
+				syncPanel();
+				saveToURL();
+			}
+
+			panel.addEventListener("input", ({ target }) => {
+				if (target.type === "checkbox") settings[target.id] = target.checked;
+				else if (target.type === "range") settings[target.id] = parseFloat(target.value);
+				else return; // seed and face apply on "change"
+
+				if (target.id === "grooves") skinDirty = true;
+				if (["width", "height", "grooves"].includes(target.id)) queueRebuild();
+				applyToggles();
+			});
+
+			ui.seed.addEventListener("change", () => {
+				const seed = parseInt(ui.seed.value);
+				if (seed > 0) newPumpkin(seed);
+				else ui.seed.value = settings.seed;
+			});
+
+			ui.face.addEventListener("change", () => {
+				settings.face = ui.face.value;
+				saveToURL();
+				buildPumpkin();
+			});
+
+			ui.newPumpkin.addEventListener("click", () => newPumpkin(randomSeed()));
+
+			// Render a fresh frame and save it straight away, before the browser
+			// clears the canvas.
+			ui.screenshot.addEventListener("click", () => {
+				renderer.render(scene, camera);
+				renderer.domElement.toBlob((blob) => {
+					const link = document.createElement("a");
+					link.href = URL.createObjectURL(blob);
+					link.download = `pumpkin-${settings.seed}-${settings.face}.png`;
+					link.click();
+					setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+				});
+			});
+
+			// =====================================================================
+			// Smoke
+			// A short wisp from the wick when the candle goes out. It rises through
+			// the pumpkin, so it shows through the carving and out of the top.
+			// =====================================================================
+
+			const [smokeCanvas, smokeCtx] = makeCanvas(64, 64);
+			const smokeGradient = smokeCtx.createRadialGradient(32, 32, 0, 32, 32, 32);
+			smokeGradient.addColorStop(0, "rgba(255, 255, 255, 0.9)");
+			smokeGradient.addColorStop(0.4, "rgba(255, 255, 255, 0.35)");
+			smokeGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+			smokeCtx.fillStyle = smokeGradient;
+			smokeCtx.fillRect(0, 0, 64, 64);
+			const smokeTexture = colorTexture(smokeCanvas);
+
+			const puffs = Array.from({ length: 40 }, () => {
+				const sprite = new THREE.Sprite(
+					new THREE.SpriteMaterial({ map: smokeTexture, color: "#b8b1a6", depthWrite: false, opacity: 0 }),
+				);
+				sprite.visible = false;
+				scene.add(sprite);
+				return { sprite, age: 0, life: 0, phase: 0, spin: 0 };
+			});
+			let smokeLeft = 0; // seconds of smoke still to come
+
+			function updateSmoke(dt, t) {
+				if (smokeLeft > 0) {
+					smokeLeft -= dt;
+					// Thick at first, thinning out.
+					const puff = Math.random() < dt * 16 * (smokeLeft / 3) && puffs.find((p) => p.life === 0);
+					if (puff) {
+						Object.assign(puff, { age: 0, life: 4.5 + 1.5 * Math.random(), phase: Math.random() * TAU, spin: Math.random() - 0.5 });
+						flame.getWorldPosition(puff.sprite.position); // the flame's base is at the wick
+						puff.sprite.visible = true;
+					}
+				}
+
+				for (const puff of puffs) {
+					if (puff.life === 0) continue;
+					puff.age += dt;
+					const k = puff.age / puff.life;
+					if (k >= 1) {
+						puff.life = 0;
+						puff.sprite.visible = false;
+						continue;
+					}
+					const p = puff.sprite.position;
+					p.y += 0.38 * (1 - 0.4 * k) * dt;
+					p.x += (0.08 * Math.sin(t * 1.3 + puff.phase) + 0.05 * k) * dt; // curls, and a faint breeze
+					p.z += 0.06 * Math.cos(t * 1.7 + puff.phase) * dt;
+					puff.sprite.scale.setScalar(0.05 + 0.45 * k);
+					puff.sprite.material.opacity = 0.42 * (1 - k) * Math.min(1, puff.age * 5);
+					puff.sprite.material.rotation += puff.spin * dt;
+				}
+			}
 
 			// =====================================================================
 			// Animation
@@ -1194,6 +1546,10 @@
 			let flickerTarget = 1;
 			let gust = 0;
 			let gustSide = 1;
+			let lit = 1; // eases between 0 and 1 when the candle is toggled
+			let ember = 1; // the wick keeps glowing a moment after the flame goes
+			let wasLit = true;
+			let lidProgress = 0; // 0 = on the pumpkin, 1 = on the table
 
 			const clock = new THREE.Clock();
 			const flameWorld = new THREE.Vector3();
@@ -1209,16 +1565,35 @@
 				gust *= Math.exp(-dt * 3);
 				flickerTarget += (Math.random() - 0.5) * dt * 2 + (1 - flickerTarget) * dt * 1.5;
 				flicker += (flickerTarget - flicker) * Math.min(1, dt * 12);
-				const level = flicker * (1 - gust) * (1 + 0.03 * Math.sin(t * 9.1) + 0.02 * Math.sin(t * 15.7 + 1.3));
 
+				const on = settings.candleLit ? 1 : 0;
+				lit += (on - lit) * Math.min(1, dt * 6);
+				ember += (on - ember) * Math.min(1, dt * 1.2);
+				if (wasLit && !settings.candleLit) smokeLeft = 3;
+				wasLit = settings.candleLit;
+				updateSmoke(dt, t);
+
+				// Lid: lift, swing over in an arc with a tip, and set down beside it.
+				const lidBefore = lidProgress;
+				lidProgress = Math.min(1, Math.max(0, lidProgress + (settings.lidOff ? dt : -dt) / 1.4));
+				const e = lidProgress * lidProgress * (3 - 2 * lidProgress);
+				const arc = Math.sin(Math.PI * e);
+				lidPivot.position.lerpVectors(lidHome, lidRest, e).y += 0.6 * arc;
+				lidPivot.rotation.set(0.15 * arc, 0.9 * e, -0.45 * arc);
+				if (lidProgress !== lidBefore) moon.shadow.needsUpdate = true;
+
+				const level = flicker * (1 - gust) * (1 + 0.03 * Math.sin(t * 9.1) + 0.02 * Math.sin(t * 15.7 + 1.3)) * lit;
 				const sway = 0.15 * Math.sin(t * 1.3) * Math.sin(t * 0.7 + 1) + gust * gustSide * 2.5;
-				candleLight.intensity = CANDLE_INTENSITY * level;
+
+				candleLight.intensity = CANDLE_INTENSITY * settings.brightness * level;
 				candleLight.position.set(lightHome.x + sway * 0.01, lightHome.y, lightHome.z + sway * 0.006);
-				waxMaterial.emissiveIntensity = 0.2 * level;
+				waxMaterial.emissiveIntensity = 0.2 * level * Math.min(1, settings.brightness);
+				emberMaterial.emissiveIntensity = 3 * ember;
 				flameMaterial.uniforms.uTime.value = t;
 				flameMaterial.uniforms.uSway.value = sway;
-				flame.scale.set(1, 0.85 + 0.25 * level, 1);
-				glow.material.opacity = 0.5 * level;
+				flame.visible = glow.visible = lit > 0.01;
+				flame.scale.set(lit, (0.85 + 0.25 * level) * lit, lit);
+				glow.material.opacity = 0.5 * level * Math.min(1, settings.brightness);
 
 				// Turn the flame to face the camera, staying upright.
 				flame.getWorldPosition(flameWorld);
@@ -1244,6 +1619,15 @@
 				renderer.setSize(width, height, false);
 			}
 
+			// =====================================================================
+			// Start
+			// =====================================================================
+
+			rollShape();
+			buildPumpkin();
+			syncPanel();
+			applyToggles();
+			saveToURL();
 			addEventListener("resize", resize);
 			resize();
 			renderer.setAnimationLoop(animate);
