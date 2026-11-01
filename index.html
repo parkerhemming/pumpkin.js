@@ -145,12 +145,14 @@
 
 			Object.assign(document.body.style, { margin: "0", overflow: "hidden", backgroundColor: "black" });
 
-			const renderer = new THREE.WebGLRenderer({ antialias: true });
-			renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+			// No antialias on the canvas itself: the scene renders into the
+			// composer's multisampled buffer, so a multisampled canvas would only
+			// take up GPU memory.
+			const renderer = new THREE.WebGLRenderer();
 			renderer.shadowMap.enabled = true;
 			renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 			renderer.toneMapping = THREE.NeutralToneMapping;
-			renderer.toneMappingExposure = 1.25;
+			renderer.toneMappingExposure = 1.4;
 			// Fixed to the viewport so the canvas can never widen the page on phones.
 			Object.assign(renderer.domElement.style, { position: "fixed", inset: "0", width: "100%", height: "100%" });
 			document.body.appendChild(renderer.domElement);
@@ -1480,6 +1482,12 @@
 				const twist = random(-0.02, 0.02);
 				const slant = [random(-0.08, 0.08), random(-0.08, 0.08)];
 				const offset = random(0, 100);
+				// How far the board's faces have moved up or down at (x, z).
+				const warp = (x, z) => {
+					const nx = x / (length / 2);
+					const nz = z / (width / 2);
+					return cup * nz * nz + bow * (1 - nx * nx) + twist * nx * nz;
+				};
 
 				for (let i = 0; i < position.count; i++) {
 					let x = position.getX(i);
@@ -1491,10 +1499,11 @@
 					if (Math.abs(nz) > 0.999) z -= Math.sign(z) * 0.02 * woodNoise(x * 3 + offset, z > 0 ? 1 : 9);
 					// Worn, rounded top edges.
 					if (y > 0) y -= 0.012 * smoothstep(0.85, 1, Math.abs(nz));
-					y += cup * nz * nz + bow * (1 - nx * nx) + twist * nx * nz;
+					y += warp(x, z);
 					position.setXYZ(i, x, y, z);
 				}
 				geometry.computeVertexNormals();
+				geometry.userData = { length, width, thickness, warp };
 				return geometry;
 			}
 
@@ -1504,6 +1513,7 @@
 			const tableDepth = plankWidths.reduce((sum, w, i) => sum + w + gaps[i], 0);
 			const tableLength = 4;
 			const plankBoxes = []; // [center, size] for each board, for physics later
+			const planks = [];
 			let plankZ = -tableDepth / 2;
 
 			for (let i = 0; i < plankWidths.length; i++) {
@@ -1516,22 +1526,43 @@
 				plank.castShadow = true;
 				plank.receiveShadow = true;
 				table.add(plank);
+				planks.push(plank);
 				plankBoxes.push([plank.position.clone(), new THREE.Vector3(length, thickness, width)]);
 				plankZ += width + gaps[i];
 			}
 
 			// Frame: an apron under the top, crooked splayed legs, and one
-			// diagonal brace somebody nailed on to stop the wobble.
+			// diagonal brace somebody nailed on to stop the wobble. The front
+			// apron has an opening for a drawer, left of the middle (it's built
+			// further down, with what's in it).
 			const frameMaterial = woodMaterial(4.6, 0.2);
 			const legX = tableLength / 2 - 0.35;
 			const legZ = tableDepth / 2 - 0.22;
+			const DRAWER = { x: -1.02, width: 1.04, height: 0.26, depth: 1.15 };
 			for (const side of [-1, 1]) {
-				const apronLong = new THREE.Mesh(new THREE.BoxGeometry(tableLength - 0.6, 0.32, 0.07), frameMaterial);
-				apronLong.position.set(0, -0.3, side * (legZ - 0.02));
-				apronLong.rotation.x = random(-0.03, 0.03);
+				const apronLength = tableLength - 0.6;
+				if (side === 1) {
+					const left = DRAWER.x - DRAWER.width / 2;
+					const right = DRAWER.x + DRAWER.width / 2;
+					for (const [x0, x1, y0, y1] of [
+						[-apronLength / 2, left, -0.46, -0.14],
+						[right, apronLength / 2, -0.46, -0.14],
+						[left, right, -0.46, -0.44],
+						[left, right, -0.16, -0.14],
+					]) {
+						const piece = new THREE.Mesh(new THREE.BoxGeometry(x1 - x0, y1 - y0, 0.07), frameMaterial);
+						piece.position.set((x0 + x1) / 2, (y0 + y1) / 2, legZ - 0.02);
+						table.add(piece);
+					}
+				} else {
+					const apronLong = new THREE.Mesh(new THREE.BoxGeometry(apronLength, 0.32, 0.07), frameMaterial);
+					apronLong.position.set(0, -0.3, side * (legZ - 0.02));
+					apronLong.rotation.x = random(-0.03, 0.03);
+					table.add(apronLong);
+				}
 				const apronShort = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.32, tableDepth - 0.4), frameMaterial);
 				apronShort.position.set(side * (legX - 0.02), -0.3, 0);
-				table.add(apronLong, apronShort);
+				table.add(apronShort);
 
 				for (const end of [-1, 1]) {
 					const leg = new THREE.Mesh(new THREE.BoxGeometry(0.17, TABLE_LEG, 0.17, 1, 6, 1), frameMaterial);
@@ -1626,11 +1657,17 @@
 								float low = exp(-max(h, 0.0) * 6.0) * smoothstep(-0.1, 0.02, h);
 								vec3 violet = mix(vec3(0.16, 0.12, 0.22), vec3(0.38, 0.09, 0.52), towardCamera);
 								color = mix(color, violet, low * (0.3 + 0.55 * towardCamera));
-								// Thin clouds drifting across, lit purple, paler near the moon.
+								// Higher up, slow patches of eerie orange, fainter than the violet,
+								// as if from a bonfire somewhere out of sight.
+								float ember = smoothstep(0.4, 0.75, fbm(dir.xz / (max(h, 0.0) + 0.35) * 0.6 + vec2(3.7, uTime * 0.002))) * smoothstep(0.08, 0.3, h) * (1.0 - smoothstep(0.65, 0.95, h));
+								color = mix(color, vec3(0.34, 0.13, 0.04), ember * 0.3);
+								// Thin clouds drifting across, lit purple (orange where the glow is),
+								// paler near the moon.
 								float c = fbm(dir.xz / (max(h, 0.0) + 0.12) * 0.9 + vec2(uTime * 0.004, 0.0));
 								float clouds = smoothstep(0.45, 0.8, c) * smoothstep(-0.02, 0.1, h) * (1.0 - smoothstep(0.45, 0.9, h));
 								float nearMoon = pow(max(dot(dir, vec3(-0.338, 0.089, -0.937)), 0.0), 8.0);
-								color = mix(color, mix(mix(vec3(0.15, 0.1, 0.2), vec3(0.3, 0.09, 0.4), towardCamera), vec3(0.6, 0.45, 0.52), nearMoon), clouds * (0.35 + 0.35 * towardCamera));
+								vec3 cloudColor = mix(mix(vec3(0.15, 0.1, 0.2), vec3(0.3, 0.09, 0.4), towardCamera), vec3(0.45, 0.2, 0.07), ember * 0.7);
+								color = mix(color, mix(cloudColor, vec3(0.6, 0.45, 0.52), nearMoon), clouds * (0.35 + 0.35 * towardCamera));
 								color *= smoothstep(-0.5, 0.0, h) * 0.8 + 0.2;
 								gl_FragColor = vec4(pow(color, vec3(2.2)), 1.0);
 							}
@@ -1897,8 +1934,8 @@
 			}
 
 			// A pillar candle: uneven body, a lumpy lip around a melted crater,
-			// heavy drips (most short, a few running nearly to the foot, each with
-			// a bead at the end) and a puddle of wax around the base.
+			// heavy drips (most short, a few running nearly to the foot) and an
+			// uneven puddle of wax around the base.
 			function buildPillar(radius, height) {
 				const phase = random(0, 100);
 				const parts = [];
@@ -1929,29 +1966,59 @@
 					),
 				);
 
+				// Each drip is one run of wax pressed flat against the side: wide
+				// where it spills over the lip, tapering as it goes, wavering a
+				// little, and ending in a slightly fatter rounded tip where it set.
+				const runs = []; // the angles of the ones that reached the bottom
 				for (let i = 0, count = randInt(24, 38); i < count; i++) {
 					const a = random(0, TAU);
 					const length = height * Math.min(0.9, Math.pow(rand(), 1.8) * 0.85 + 0.04);
-					const r = random(0.014, 0.034);
+					const w = random(0.016, 0.036);
 					const top = height + random(-0.01, 0.035);
-					const points = Array.from({ length: 7 }, (_, k) => {
-						const t = k / 6;
-						const aa = a + 0.05 * Math.sin(t * 3 + i);
-						const rr = radius + r * 0.35 + 0.012 * (1 - t);
-						return new THREE.Vector3(Math.cos(aa) * rr, top - length * t, Math.sin(aa) * rr);
-					});
-					parts.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points), 10, r, 6, false));
-					const end = points[6];
-					parts.push(new THREE.SphereGeometry(r * 1.4, 8, 6).scale(1, 1.3, 1).translate(end.x, end.y, end.z));
+					const bead = Math.min(length * 0.45, w * random(2.2, 3.6)) / 2; // half its length
+					const wobble = random(0, TAU);
+					const profile = [];
+					for (let k = 0; k <= 24; k++) {
+						const fromTip = length * (k / 24) ** 1.6; // closer together near the tip
+						const t = 1 - fromTip / length; // 0 at the top
+						const body = w * (0.85 + 0.9 * (1 - smoothstep(0, 0.4, t)) - 0.15 * t + 0.08 * Math.sin(t * 19 + wobble));
+						const swell = w * 0.95 * Math.sqrt(Math.max(0, 1 - ((fromTip - bead) / bead) ** 2));
+						profile.push([fromTip < bead ? swell : Math.max(body, swell), fromTip]);
+					}
+					const drip = displace(lathe(profile, 10), (x, y, z) => [x * 1.3 + 0.008 * Math.sin(y * 9 + wobble) * smoothstep(0, length, y), y, z * 0.42]);
+					drip.rotateY(Math.PI / 2 - a).translate(Math.cos(a) * radius, top - length, Math.sin(a) * radius);
+					parts.push(drip);
+					if (length > height * 0.75) runs.push(a);
 				}
 
+				// The puddle: how far it reaches beyond the candle varies around it,
+				// further where the long drips ran down into it, with a rounded edge.
+				const reach = (a) => {
+					let k = 0.25 + 0.6 * woodNoise(Math.cos(a) * 1.4 + phase, Math.sin(a) * 1.4 + phase) ** 1.5;
+					for (const run of runs) k += 0.45 * Math.exp(-((Math.atan2(Math.sin(a - run), Math.cos(a - run)) / 0.28) ** 2));
+					return k;
+				};
 				parts.push(
-					lathe([
-						[radius * 1.5, 0],
-						[radius * 1.35, 0.03],
-						[radius * 1.08, 0.05],
-						[radius * 0.98, 0.07],
-					]),
+					displace(
+						lathe(
+							[
+								[1.5, 0],
+								[1.49, 0.012],
+								[1.46, 0.022],
+								[1.38, 0.031],
+								[1.2, 0.043],
+								[1.05, 0.058],
+								[0.98, 0.075],
+							].map(([r, y]) => [radius * r, y]),
+							96,
+						),
+						(x, y, z) => {
+							const k = reach(Math.atan2(z, x));
+							const out = 1 + (Math.hypot(x, z) / radius - 1) * 2 * k; // 0.5 radius out becomes k radii
+							const scale = Math.hypot(x, z) ? (radius * out) / Math.hypot(x, z) : 1;
+							return [x * scale, y * (0.75 + 0.4 * k), z * scale];
+						},
+					),
 				);
 
 				for (const part of parts) {
@@ -1961,6 +2028,28 @@
 					part.setAttribute("aGlow", new THREE.BufferAttribute(glowAmount, 1));
 				}
 				return mergeGeometries(parts);
+			}
+
+			// Wax that spread past the edge of the table folds over it and runs a
+			// little way down the side: each point of the puddle (the bit just
+			// above the tabletop) is moved back to the edge and down by as far as
+			// it was over, keeping its thickness off the side.
+			function overTableEdge(geometry, cx, cz) {
+				const back = table.position.z - tableDepth / 2;
+				const front = table.position.z + tableDepth / 2;
+				return displace(geometry, (x, y, z) => {
+					const wx = cx + x;
+					const wz = cz + z;
+					const [center, size] = plankBoxes.reduce((a, b) => (Math.abs(b[0].z + table.position.z - wz) < Math.abs(a[0].z + table.position.z - wz) ? b : a));
+					const left = table.position.x + center.x - size.x / 2;
+					const right = left + size.x;
+					const ox = wx < left ? wx - left : wx > right ? wx - right : 0;
+					const oz = wz < back ? wz - back : wz > front ? wz - front : 0;
+					const over = Math.hypot(ox, oz);
+					if (!over || y > 0.12) return [x, y, z];
+					const off = 0.008 + 0.6 * y;
+					return [x - ox + (ox / over) * off, y - over, z - oz + (oz / over) * off];
+				});
 			}
 
 			rand = mulberry32(77);
@@ -1973,9 +2062,8 @@
 				[-1.3, -0.25, 0.26, 0.7],
 			]) {
 				const wax = glowingWax(new THREE.Color("#e6d9c0").offsetHSL(random(-0.01, 0.01), random(-0.05, 0.05), random(-0.04, 0.03)));
-				const candle = new THREE.Mesh(buildPillar(radius, height), wax);
+				const candle = new THREE.Mesh(overTableEdge(buildPillar(radius, height).rotateY(random(0, TAU)), x, z), wax);
 				candle.position.set(x, 0, z);
-				candle.rotation.y = random(0, TAU);
 				candleCluster.add(candle);
 				const wickTop = new THREE.Vector3(x, height - 0.03, z);
 				const wick = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.07, 6), new THREE.MeshStandardMaterial({ color: "#1b130d" }));
@@ -3073,6 +3161,280 @@
 			}
 
 			// =====================================================================
+			// The drawer
+			// Click the drawer in the front of the table and it slides open: old
+			// photographs with the faces scratched out, a kitchen knife, and a
+			// finger. Click it again to shut it.
+			// =====================================================================
+
+			// A cabinet card: a sepia print on a yellowed mount, foxed and scratched.
+			function oldPhoto(kind) {
+				const [canvas, ctx] = makeCanvas(256, 340);
+				ctx.fillStyle = "#cbbd9c";
+				ctx.fillRect(0, 0, 256, 340);
+				const glow = ctx.createRadialGradient(128, 130, 10, 128, 150, 180);
+				glow.addColorStop(0, "#b49b73");
+				glow.addColorStop(1, "#3c2c1e");
+				ctx.fillStyle = glow;
+				ctx.fillRect(22, 22, 212, 262);
+				// [x, scale] for each sitter: a woman alone, a family, a man.
+				const sitters = [[[128, 1]], [[78, 0.8], [178, 0.85], [128, 0.55]], [[128, 1.05]]][kind];
+				for (const [x, k] of sitters) {
+					const headY = 284 - 190 * k;
+					ctx.fillStyle = "#1e150e";
+					ctx.beginPath();
+					ctx.moveTo(x - 60 * k, 284);
+					ctx.quadraticCurveTo(x - 52 * k, headY + 40 * k, x, headY + 34 * k);
+					ctx.quadraticCurveTo(x + 52 * k, headY + 40 * k, x + 60 * k, 284);
+					ctx.fill();
+					ctx.fillStyle = "#c7b08a";
+					ctx.beginPath();
+					ctx.ellipse(x, headY, 19 * k, 25 * k, 0, 0, TAU);
+					ctx.fill();
+					ctx.fillStyle = "#2a1d13";
+					ctx.beginPath();
+					ctx.ellipse(x, headY - 12 * k, 21 * k, 15 * k, 0, Math.PI, TAU);
+					ctx.fill();
+					for (const side of [-1, 1]) {
+						ctx.beginPath();
+						ctx.ellipse(x + side * 7 * k, headY + 1 * k, 3.5 * k, 2.5 * k, 0, 0, TAU);
+						ctx.fill();
+					}
+				}
+				// Somebody went at the faces with a pin.
+				const scratched = kind === 1 ? [sitters[2]] : sitters;
+				ctx.strokeStyle = "rgba(240, 232, 214, 0.85)";
+				for (const [x, k] of scratched) {
+					const headY = 284 - 190 * k;
+					ctx.lineWidth = 1.2;
+					for (let i = 0; i < (kind === 1 ? 40 : 14); i++) {
+						ctx.beginPath();
+						const y = headY + (kind === 1 ? random(-22, 22) : random(-3, 5)) * k;
+						ctx.moveTo(x + random(-18, -6) * k, y);
+						ctx.lineTo(x + random(6, 18) * k, y + random(-6, 6) * k);
+						ctx.stroke();
+					}
+				}
+				for (let i = 0; i < 45; i++) {
+					ctx.fillStyle = `rgba(120, 75, 30, ${random(0.08, 0.3)})`;
+					ctx.beginPath();
+					ctx.arc(random(0, 256), random(0, 340), random(1, 6), 0, TAU);
+					ctx.fill();
+				}
+				ctx.strokeStyle = "rgba(230, 220, 200, 0.4)";
+				ctx.lineWidth = 0.7;
+				for (let i = 0; i < 8; i++) {
+					ctx.beginPath();
+					ctx.moveTo(random(22, 234), random(22, 284));
+					ctx.lineTo(random(22, 234), random(22, 284));
+					ctx.stroke();
+				}
+				ctx.fillStyle = "#4a3a28";
+				ctx.font = "italic 15px Georgia, serif";
+				ctx.textAlign = "center";
+				ctx.fillText(["Mother, 1891", "Never again", "Father"][kind], 128, 314);
+				return colorTexture(canvas);
+			}
+
+			function buildKnife() {
+				const knife = new THREE.Group();
+				const shape = new THREE.Shape();
+				shape.moveTo(0, 0);
+				shape.lineTo(0.55, 0);
+				shape.quadraticCurveTo(0.76, 0, 0.86, 0.06);
+				shape.quadraticCurveTo(0.72, 0.1, 0.55, 0.11);
+				shape.lineTo(0, 0.11);
+				shape.closePath();
+				const blade = new THREE.ExtrudeGeometry(shape, { depth: 0.008, bevelEnabled: true, bevelThickness: 0.004, bevelSize: 0.005, bevelSegments: 1 });
+				// Steel gone dull and spotted with rust, and something dried dark on it.
+				const [canvas, ctx] = makeCanvas(256, 64);
+				ctx.fillStyle = "#9a9a96";
+				ctx.fillRect(0, 0, 256, 64);
+				for (let i = 0; i < 60; i++) {
+					ctx.fillStyle = rand() < 0.6 ? `rgba(120, 60, 25, ${random(0.2, 0.6)})` : `rgba(60, 8, 6, ${random(0.4, 0.8)})`;
+					const x = rand() < 0.5 ? random(0, 256) : random(150, 256);
+					ctx.beginPath();
+					ctx.ellipse(x, random(0, 64), random(2, 12), random(1, 5), random(0, 3), 0, TAU);
+					ctx.fill();
+				}
+				const map = colorTexture(canvas);
+				map.repeat.set(1 / 0.86, 1 / 0.11);
+				knife.add(new THREE.Mesh(blade, new THREE.MeshStandardMaterial({ map, metalness: 0.85, roughness: 0.45 })));
+				const handle = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.1, 0.06), new THREE.MeshStandardMaterial({ color: "#3a2416", roughness: 0.8 }));
+				handle.position.set(-0.2, 0.055, 0.004);
+				knife.add(handle);
+				for (const x of [-0.07, -0.2, -0.33]) {
+					const rivet = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.07, 8).rotateX(Math.PI / 2), new THREE.MeshStandardMaterial({ color: "#8a6a3a", metalness: 0.8, roughness: 0.4 }));
+					rivet.position.set(x, 0.055, 0.004);
+					knife.add(rivet);
+				}
+				return knife;
+			}
+
+			// A finger: three joints, knuckles, a dirty nail, and the cut end.
+			function buildFinger() {
+				const finger = new THREE.Group();
+				const geometry = displace(
+					lathe(
+						[
+							[0.05, 0],
+							[0.054, 0.03],
+							[0.058, 0.16],
+							[0.049, 0.22],
+							[0.052, 0.3],
+							[0.045, 0.36],
+							[0.043, 0.44],
+							[0.034, 0.49],
+							[0.018, 0.515],
+							[0.001, 0.52],
+						],
+						20,
+					),
+					(x, y, z) => [x, y, z * 0.85 - 0.22 * Math.max(0, y - 0.16) - 0.18 * Math.max(0, y - 0.3)], // bent at the knuckles
+				);
+				// Waxy and grey, bruised dark toward the cut, creased at the knuckles.
+				const colors = [];
+				const position = geometry.attributes.position;
+				for (let i = 0; i < position.count; i++) {
+					const y = position.getY(i);
+					const bruise = smoothstep(0.08, 0, y);
+					const crease = 1 - 0.35 * (Math.exp(-(((y - 0.165) / 0.01) ** 2)) + Math.exp(-(((y - 0.305) / 0.009) ** 2)));
+					colors.push((0.93 - 0.4 * bruise) * crease, (0.86 - 0.55 * bruise) * crease, (0.8 - 0.4 * bruise) * crease);
+				}
+				geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+				finger.add(new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: "#e2d2c4", vertexColors: true, roughness: 0.45 })));
+				const nail = new THREE.Mesh(new THREE.SphereGeometry(0.032, 12, 8).scale(1, 1.4, 0.35), new THREE.MeshStandardMaterial({ color: "#b8a68e", roughness: 0.35 }));
+				nail.position.set(0, 0.465, -0.058);
+				nail.rotation.x = -0.38;
+				finger.add(nail);
+				// The cut end: flesh, and the bone in the middle.
+				const [canvas, ctx] = makeCanvas(64, 64);
+				ctx.fillStyle = "#3a0806";
+				ctx.fillRect(0, 0, 64, 64);
+				ctx.fillStyle = "#7a1410";
+				ctx.beginPath();
+				ctx.arc(32, 32, 26, 0, TAU);
+				ctx.fill();
+				ctx.fillStyle = "#e6dcc4";
+				ctx.beginPath();
+				ctx.arc(31, 33, 9, 0, TAU);
+				ctx.fill();
+				const stump = new THREE.Mesh(new THREE.CircleGeometry(0.05, 20).rotateX(Math.PI / 2), new THREE.MeshStandardMaterial({ map: colorTexture(canvas), roughness: 0.3 }));
+				stump.scale.z = 0.85;
+				finger.add(stump);
+				return finger;
+			}
+
+			rand = mulberry32(4040);
+			const drawer = new THREE.Group();
+			const drawerHome = new THREE.Vector3(DRAWER.x + table.position.x, -0.3, legZ - 0.02 + table.position.z); // shut, in world space
+			// Its box is solid too, so whatever's put back in it stays in and rides along.
+			const drawerBody = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(drawerHome.x, drawerHome.y, drawerHome.z));
+			// Things in it come out the first time you take hold of them.
+			const inDrawer = (item, collider) =>
+				interactives.push({
+					object: item,
+					lift() {
+						delete this.lift;
+						scene.attach(item);
+						this.body = addDynamic(item, [collider()], { density: 0.6, friction: 0.8 });
+					},
+					// When you start to drag it, it pops straight up out of the drawer:
+					// above the tabletop if it's out in front, or just over the drawer's
+					// sides if it's still underneath.
+					pop() {
+						delete this.pop;
+						const t = this.body.translation();
+						this.body.setTranslation({ x: t.x, y: t.z - 0.3 > tableFront ? 0.2 : -0.16, z: t.z }, true);
+					},
+				});
+			{
+				const { width, height, depth } = DRAWER;
+				const part = (w, h, d, x, y, z) => {
+					const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), frameMaterial);
+					mesh.position.set(x, y, z);
+					drawer.add(mesh);
+					world.createCollider(RAPIER.ColliderDesc.cuboid(w / 2, h / 2, d / 2).setTranslation(x, y, z), drawerBody);
+				};
+				part(width - 0.03, height - 0.02, 0.07, 0, 0, 0); // front
+				part(width - 0.1, 0.02, depth, 0, -height / 2 + 0.02, -depth / 2); // bottom
+				part(width - 0.1, height - 0.06, 0.03, 0, -0.02, -depth + 0.015); // back
+				for (const side of [-1, 1]) part(0.03, height - 0.06, depth, side * (width / 2 - 0.065), -0.02, -depth / 2);
+				// A tarnished brass ring pull.
+				const brass = new THREE.MeshStandardMaterial({ color: "#a07c40", metalness: 0.85, roughness: 0.35 });
+				const plate = new THREE.Mesh(new THREE.SphereGeometry(0.04, 12, 8).scale(1, 1, 0.4), brass);
+				plate.position.set(0, 0.045, 0.04);
+				const ring = new THREE.Mesh(new THREE.TorusGeometry(0.06, 0.011, 8, 24), brass);
+				ring.position.set(0, -0.01, 0.05);
+				ring.rotation.x = -0.25;
+				drawer.add(plate, ring);
+
+				const floor = -height / 2 + 0.031;
+				// Placed toward the middle, where you can see in past the front.
+				[
+					[0, -0.19, -0.45, 0.4],
+					[1, 0.18, -0.55, -0.3],
+					[2, -0.02, -0.85, 0.1],
+				].forEach(([kind, x, z, angle], i) => {
+					const photo = new THREE.Mesh(new THREE.PlaneGeometry(0.4, 0.53).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ map: oldPhoto(kind), roughness: 0.75 }));
+					photo.position.set(x, floor + 0.002 * (i + 1), z);
+					photo.rotation.y = angle;
+					drawer.add(photo);
+					inDrawer(photo, () => RAPIER.ColliderDesc.cuboid(0.2, 0.003, 0.265));
+				});
+				const knife = buildKnife();
+				knife.scale.setScalar(0.72);
+				knife.rotation.set(-Math.PI / 2, 0, 0.18);
+				knife.position.set(-0.17, floor + 0.026, -0.62);
+				drawer.add(knife);
+				inDrawer(knife, () => hull(knife, 2));
+				const finger = buildFinger();
+				finger.rotation.set(-Math.PI / 2 + 0.25, Math.PI / 2, 0, "YXZ"); // nail up, pointing left
+				finger.position.set(0.36, floor + 0.058, -0.4);
+				drawer.add(finger);
+				inDrawer(finger, () => hull(finger, 2));
+				const blood = new THREE.Mesh(
+					displace(new THREE.CircleGeometry(0.09, 24).rotateX(-Math.PI / 2), (x, y, z) => {
+						const k = 1 + 0.25 * Math.sin(Math.atan2(z, x) * 5 + 1);
+						return [x * k, y, z * k];
+					}),
+					new THREE.MeshStandardMaterial({ color: "#2a0605", roughness: 0.25 }),
+				);
+				blood.position.set(0.38, floor + 0.009, -0.4);
+				drawer.add(blood);
+			}
+			drawer.position.set(DRAWER.x, -0.3, legZ - 0.02);
+			table.add(shadowed(drawer));
+
+			// Drag it by its front: it follows the pointer along its runners,
+			// rasping as it goes and knocking when it hits either end.
+			const drawerState = { amount: 0, from: 0, along: new THREE.Vector2(), rasp: 0 };
+			interactives.push({
+				object: drawer,
+				grab() {
+					// The full travel, shut to open, as a distance across the screen in pixels.
+					const shut = drawer.localToWorld(new THREE.Vector3(0, 0, -1.05 * drawerState.amount)).project(camera);
+					const out = drawer.localToWorld(new THREE.Vector3(0, 0, 1.05 * (1 - drawerState.amount))).project(camera);
+					drawerState.along.set(((out.x - shut.x) * innerWidth) / 2, ((shut.y - out.y) * innerHeight) / 2);
+					drawerState.from = drawerState.amount;
+				},
+				pull(dx, dy) {
+					const { along } = drawerState;
+					const amount = clamp(drawerState.from + (dx * along.x + dy * along.y) / Math.max(along.lengthSq(), 400), 0, 1);
+					const at = drawer.getWorldPosition(new THREE.Vector3());
+					if ((amount === 0 || amount === 1) && amount !== drawerState.amount) sounds.knock(at);
+					drawerState.rasp += Math.abs(amount - drawerState.amount);
+					if (drawerState.rasp > 0.07) {
+						drawerState.rasp = 0;
+						sounds.scrape(at);
+					}
+					drawerState.amount = amount;
+					drawer.position.z = legZ - 0.02 + 1.05 * amount;
+					drawerBody.setNextKinematicTranslation({ x: drawerHome.x, y: drawerHome.y, z: drawerHome.z + 1.05 * amount });
+				},
+			});
+
+			// =====================================================================
 			// Picking up and clicking
 			// Releasing with barely any movement is a click. Pressing on something
 			// you can pick up takes the pointer away from the camera controls, and
@@ -3083,8 +3445,9 @@
 
 			const raycaster = new THREE.Raycaster();
 			const pointerNDC = new THREE.Vector2();
-			// Things that block picking: you can't grab what's hidden behind the pumpkin.
-			const occluders = pumpkin.children.filter((child) => child.isMesh && child.material !== wireMaterial);
+			// Things that block picking: you can't grab what's hidden behind the
+			// pumpkin, or in the drawer through the tabletop.
+			const occluders = [...pumpkin.children.filter((child) => child.isMesh && child.material !== wireMaterial), ...planks];
 			const pickables = [...interactives.map((entry) => entry.object), lidRoot, ...occluders];
 			interactives.push({ object: lidRoot, body: lidBody });
 
@@ -3112,16 +3475,53 @@
 			const dragOffset = new THREE.Vector3();
 			const dragTarget = new THREE.Vector3();
 
+			const firstFinger = { pointerId: 0, x: 0, y: 0 }; // where the primary pointer is now
+			let handingOver = false; // true while replaying the first finger to the controls
+
 			addEventListener(
 				"pointerdown",
 				(event) => {
-					if (!event.isPrimary || event.button !== 0 || event.target !== renderer.domElement) return;
+					if (handingOver || !event.isPrimary || event.button !== 0 || event.target !== renderer.domElement) return;
+					Object.assign(firstFinger, { pointerId: event.pointerId, x: event.clientX, y: event.clientY });
 					const hit = pick(event);
 					if (!hit) return;
+					hit.entry.lift?.();
 					press = { ...hit, x: event.clientX, y: event.clientY, dragging: false };
-					if (!hit.entry.body) return; // click-only: leave the camera free to drag
+					if (!hit.entry.body && !hit.entry.grab) return; // click-only: leave the camera free to drag
 					controls.enabled = false; // the controls' own listener runs after this one
 					dragTarget.copy(hit.point);
+				},
+				{ capture: true },
+			);
+
+			// A second finger means a pinch, even if the first one landed on
+			// something you can pick up: drop it, and give the gesture to the camera.
+			// The controls never saw the first finger go down, so replay it to them
+			// before this second one arrives, or they'd see one finger, not a pinch.
+			addEventListener(
+				"pointerdown",
+				(event) => {
+					if (!press || event.isPrimary) return;
+					const { entry, dragging } = press;
+					press = null;
+					if (!entry.body && !entry.grab) return; // click-only: the controls already have the first finger
+					if (dragging) entry.body?.setGravityScale(1, true);
+					renderer.domElement.style.cursor = "";
+					controls.enabled = true;
+					handingOver = true;
+					renderer.domElement.dispatchEvent(
+						new PointerEvent("pointerdown", {
+							pointerId: firstFinger.pointerId,
+							pointerType: event.pointerType,
+							isPrimary: true,
+							clientX: firstFinger.x,
+							clientY: firstFinger.y,
+							button: 0,
+							buttons: 1,
+							bubbles: true,
+						}),
+					);
+					handingOver = false;
 				},
 				{ capture: true },
 			);
@@ -3129,9 +3529,17 @@
 			addEventListener(
 				"pointermove",
 				(event) => {
+					if (event.isPrimary) Object.assign(firstFinger, { x: event.clientX, y: event.clientY });
 					if (!press || !event.isPrimary) return;
+					if (!press.dragging && press.entry.grab && Math.hypot(event.clientX - press.x, event.clientY - press.y) > 6) {
+						press.entry.grab();
+						press.dragging = true;
+						renderer.domElement.style.cursor = "grabbing";
+					}
+					if (press.dragging && press.entry.pull) return press.entry.pull(event.clientX - press.x, event.clientY - press.y);
 					if (!press.dragging && press.entry.body && Math.hypot(event.clientX - press.x, event.clientY - press.y) > 6) {
 						const body = press.entry.body;
+						press.entry.pop?.();
 						body.wakeUp();
 						body.setGravityScale(0, true);
 						camera.getWorldDirection(_v);
@@ -3153,7 +3561,7 @@
 			function release(event) {
 				if (!press || !event.isPrimary) return;
 				if (press.dragging) {
-					press.entry.body.setGravityScale(1, true);
+					press.entry.body?.setGravityScale(1, true);
 					renderer.domElement.style.cursor = "";
 				} else if (Math.hypot(event.clientX - press.x, event.clientY - press.y) <= 6) {
 					press.entry.onClick?.();
@@ -3166,7 +3574,7 @@
 			addEventListener("pointercancel", release, { capture: true });
 
 			function updateDrag() {
-				if (!press?.dragging) return;
+				if (!press?.dragging || !press.entry.body) return;
 				const body = press.entry.body;
 				const t = body.translation();
 				_v.set(dragTarget.x - dragOffset.x - t.x, dragTarget.y - dragOffset.y - t.y, dragTarget.z - dragOffset.z - t.z).multiplyScalar(14);
@@ -3217,9 +3625,10 @@
 					entry.mesh.visible = entry.lit > 0.01;
 					entry.mesh.scale.set(entry.lit, (0.85 + 0.2 * level) * entry.lit, entry.lit);
 					entry.mesh.getWorldPosition(_v);
-					entry.mesh.rotation.y = Math.atan2(camera.position.x - _v.x, camera.position.z - _v.z);
+					entry.mesh.rotation.y = Math.atan2(camera.position.x - _v.x, camera.position.z - _v.z) - entry.mesh.parent.rotation.y;
 					entry.wax.userData.level.value = level;
-					clusterLit += level;
+					if (entry.light) entry.light.intensity = entry.power * level;
+					else clusterLit += level;
 				}
 				clusterLight.intensity = (CLUSTER_INTENSITY * clusterLit) / clusterFlames.length;
 
@@ -3474,7 +3883,7 @@
 				[18, -31],
 				[-4, -38],
 				[8, -39],
-				[-21, -11],
+				[27, -13], // by the tree on the right, so that side isn't empty
 				[22, -24],
 			]) {
 				const stone = new THREE.Mesh(rand() < 0.18 ? buildCross() : buildGravestone(rand() < 0.6 ? 0 : 1), stoneMaterial);
@@ -3594,6 +4003,16 @@
 			haloGradient.addColorStop(0.35, "rgba(200, 160, 130, 0.18)");
 			haloGradient.addColorStop(1, "rgba(120, 110, 120, 0)");
 			haloCtx.fillStyle = haloGradient;
+			haloCtx.fillRect(0, 0, 256, 256);
+			// Fade it out before the far edge of the ground, about 3° below level,
+			// or the ground cuts it off in a hard line along the horizon. The halo
+			// spans about 18.5° either side of the moon, which is 5° up, so the
+			// canvas has about 7 pixels to a degree.
+			const horizonFade = haloCtx.createLinearGradient(0, 146, 0, 180);
+			horizonFade.addColorStop(0, "#fff");
+			horizonFade.addColorStop(1, "rgba(255, 255, 255, 0)");
+			haloCtx.globalCompositeOperation = "destination-in";
+			haloCtx.fillStyle = horizonFade;
 			haloCtx.fillRect(0, 0, 256, 256);
 			const moonHalo = new THREE.Sprite(
 				new THREE.SpriteMaterial({ map: colorTexture(haloCanvas), blending: THREE.AdditiveBlending, depthWrite: false, fog: false, opacity: 0.6 }),
@@ -3718,6 +4137,195 @@
 			broom.position.set(2.65, groundY, -1.45); // against the back corner, out of the camera's way
 			broom.rotation.set(-0.02, 0.3, 0.07);
 			scene.add(shadowed(broom));
+
+			// --- An old upright piano, off to the far left ------------------------
+			// Turn as far left as you can and it's there, half in view at the edge
+			// of the screen. Where it stands depends on the screen's shape, so
+			// that's true on any screen (see placePiano). A candle on top lights
+			// the music on the stand, which is upside down. Click it and it plays.
+
+			function sheetMusic() {
+				const [canvas, ctx] = makeCanvas(256, 340);
+				ctx.fillStyle = "#cbb993";
+				ctx.fillRect(0, 0, 256, 340);
+				for (let i = 0; i < 50; i++) {
+					ctx.fillStyle = `rgba(110, 70, 30, ${random(0.05, 0.2)})`;
+					ctx.beginPath();
+					ctx.arc(random(0, 256), random(0, 340), random(1, 7), 0, TAU);
+					ctx.fill();
+				}
+				ctx.fillStyle = ctx.strokeStyle = "#2a2018";
+				ctx.font = "italic 17px Georgia, serif";
+				ctx.textAlign = "center";
+				ctx.fillText("Marche funèbre", 128, 30);
+				for (let staff = 0; staff < 8; staff++) {
+					const top = 52 + staff * 35;
+					ctx.lineWidth = 0.8;
+					for (let line = 0; line < 5; line++) {
+						ctx.beginPath();
+						ctx.moveTo(16, top + line * 4);
+						ctx.lineTo(240, top + line * 4);
+						ctx.stroke();
+					}
+					for (let x = 34; x < 236; x += random(9, 16)) {
+						const y = top + randInt(-2, 10) * 2;
+						ctx.beginPath();
+						ctx.ellipse(x, y, 3, 2.2, -0.4, 0, TAU);
+						ctx.fill();
+						ctx.beginPath();
+						ctx.moveTo(x + 2.6, y);
+						ctx.lineTo(x + 2.6, y - 13);
+						ctx.stroke();
+					}
+				}
+				return colorTexture(canvas);
+			}
+
+			function buildPiano() {
+				const piano = new THREE.Group();
+				const wood = woodMaterial(4, 1);
+				wood.color.set("#8a5c44"); // old, darkened varnish
+				wood.roughness = 0.6;
+				const panel = wood.clone();
+				panel.color.set("#5e3c2c");
+				const brass = new THREE.MeshStandardMaterial({ color: "#8a6a3a", metalness: 0.8, roughness: 0.45 });
+				const box = (w, h, d, x, y, z, material = wood) => {
+					const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+					mesh.position.set(x, y, z);
+					piano.add(mesh);
+					return mesh;
+				};
+				// The case, about 145 cm wide and 130 tall; the keys face +z.
+				box(9.7, 0.25, 2.8, 0, 0.125, -0.5); // plinth
+				box(9.0, 4.15, 2.55, 0, 2.3, -0.575); // below the keys
+				box(9.0, 3.5, 2.15, 0, 6.75, -0.775); // above the keys
+				box(9.9, 0.18, 2.7, 0, 8.59, -0.6); // top
+				box(7.6, 3.2, 0.06, 0, 2.3, 0.72, panel);
+				box(7.4, 2.0, 0.06, 0, 7.4, 0.32, panel);
+				for (const side of [-1, 1]) {
+					box(0.32, 8.4, 2.55, side * 4.66, 4.2, -0.575); // cheek
+					box(0.32, 0.6, 1.5, side * 4.66, 4.65, 1.45); // arm
+					const leg = new THREE.Mesh(
+						lathe([
+							[0.17, 0],
+							[0.21, 0.15],
+							[0.13, 0.45],
+							[0.23, 1.3],
+							[0.15, 2.5],
+							[0.22, 3.6],
+							[0.14, 3.95],
+							[0.21, 4.35],
+						], 16),
+						wood,
+					);
+					leg.position.set(side * 4.66, 0, 1.9);
+					piano.add(leg);
+				}
+				box(9.0, 0.3, 2.0, 0, 4.45, 1.0); // keybed
+				box(9.0, 0.32, 0.08, 0, 4.48, 2.02); // key slip
+				box(6.4, 0.08, 0.3, 0, 5.05, 0.55); // music ledge
+				const desk = box(6.2, 1.8, 0.08, 0, 5.95, 0.42);
+				desk.rotation.x = -0.18;
+
+				// 88 keys: 52 white, yellowed unevenly, a few stuck down; 36 black.
+				const keyWidth = 8.4 / 52;
+				const whites = new THREE.InstancedMesh(new THREE.BoxGeometry(keyWidth * 0.93, 0.16, 1.15), new THREE.MeshStandardMaterial({ roughness: 0.45 }), 52);
+				const blacks = new THREE.InstancedMesh(new THREE.BoxGeometry(keyWidth * 0.55, 0.16, 0.7), new THREE.MeshStandardMaterial({ color: "#141110", roughness: 0.35 }), 36);
+				const key = new THREE.Object3D();
+				const ivory = new THREE.Color();
+				for (let i = 0, black = 0; i < 52; i++) {
+					const x = -4.2 + keyWidth * (i + 0.5);
+					key.position.set(x, 4.68 - (rand() < 0.06 ? 0.05 : 0), 1.42);
+					key.updateMatrix();
+					whites.setMatrixAt(i, key.matrix);
+					whites.setColorAt(i, ivory.set("#d9ccaa").offsetHSL(random(-0.01, 0.01), random(0, 0.15), random(-0.1, 0.02)));
+					if ("ACDFG".includes("ABCDEFG"[i % 7]) && i < 51) {
+						key.position.set(x + keyWidth / 2, 4.78, 1.15);
+						key.updateMatrix();
+						blacks.setMatrixAt(black++, key.matrix);
+					}
+				}
+				piano.add(whites, blacks);
+
+				// The music, upside down on the stand, mostly on the side that shows.
+				for (const [x, tilt] of [
+					[0.75, 0.02],
+					[2.15, -0.05],
+				]) {
+					const sheet = new THREE.Mesh(new THREE.PlaneGeometry(1.35, 1.8), new THREE.MeshStandardMaterial({ map: sheetMusic(), roughness: 0.9, side: THREE.DoubleSide }));
+					sheet.position.set(x, 6.0, 0.48);
+					sheet.rotation.set(-0.18, 0, Math.PI + tilt);
+					piano.add(sheet);
+				}
+
+				// Pedals, and a bench pushed back askew.
+				for (const x of [-0.45, 0, 0.45]) box(0.22, 0.07, 0.6, x, 0.45, 0.95, brass);
+				const bench = new THREE.Group();
+				bench.add(new THREE.Mesh(new THREE.BoxGeometry(4.4, 0.3, 1.6), wood));
+				bench.children[0].position.y = 3.15;
+				for (const [x, z] of [
+					[-1.9, -0.6],
+					[1.9, -0.6],
+					[-1.9, 0.6],
+					[1.9, 0.6],
+				]) {
+					const leg = new THREE.Mesh(new THREE.BoxGeometry(0.22, 3.0, 0.22), wood);
+					leg.position.set(x, 1.5, z);
+					bench.add(leg);
+				}
+				bench.position.set(0.6, 0, 3.8);
+				bench.rotation.y = 0.22;
+				piano.add(bench);
+
+				// A candle on a brass sconce swung out from the front of the case.
+				const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.75, 8).rotateX(Math.PI / 2), brass);
+				arm.position.set(3.3, 6.75, 0.65);
+				const cup = new THREE.Mesh(
+					lathe([
+						[0.06, 0],
+						[0.3, 0.06],
+						[0.12, 0.12],
+						[0.16, 0.3],
+					], 20),
+					brass,
+				);
+				cup.position.set(3.3, 6.75, 1.0);
+				piano.add(arm, cup);
+				const wax = glowingWax("#ddd0b4");
+				const candle = new THREE.Mesh(buildPillar(0.13, 0.75), wax);
+				candle.position.set(3.3, 6.95, 1.0);
+				piano.add(candle);
+				const wick = new THREE.Vector3(3.3, 6.95 + 0.72, 1.0);
+				const light = new THREE.PointLight("#ffa850", 0, 12, 1.4);
+				light.position.copy(wick).add(new THREE.Vector3(0, 0.25, 0.3));
+				piano.add(light);
+				Object.assign(addFlame(piano, wick, 0.08, 0.24, wax), { light, power: 9 });
+
+				piano.userData.soundAt = new THREE.Vector3();
+				return shadowed(piano);
+			}
+
+			rand = mulberry32(8808);
+			const piano = buildPiano();
+			scene.add(piano);
+			interactives.push({ object: piano, onClick: () => sounds.pianoSong() });
+			pickables.push(piano);
+
+			// Put the piano where its middle lands at the left edge of the view
+			// when the camera is turned all the way left (at its starting distance
+			// and height), nudged out so a little under half of it shows. It
+			// stands further back on narrow screens, so it takes up about the
+			// same share of any screen.
+			function placePiano() {
+				const toCamera = new THREE.Spherical().setFromVector3(cameraHome.clone().sub(controls.target));
+				toCamera.theta = turn + SWING;
+				const eye = controls.target.clone().add(new THREE.Vector3().setFromSpherical(toCamera));
+				const halfWidth = Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.aspect);
+				const edge = controls.target.clone().sub(eye).setY(0).normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), halfWidth + 0.02);
+				piano.position.copy(eye).addScaledVector(edge, clamp(12 / Math.tan(halfWidth), 17, 26)).setY(groundY);
+				piano.rotation.y = Math.atan2(eye.x - piano.position.x, eye.z - piano.position.z) - 0.3;
+				piano.userData.soundAt.copy(piano.position).y += 4.5;
+			}
 
 			// =====================================================================
 			// Creatures
@@ -4159,48 +4767,121 @@
 			}
 
 			// --- The black cat, prowling between the far gravestones --------------
+			// Built like a real one: a long body, deep in the chest and narrow at
+			// the waist; a small head with big ears; jointed legs, the hind ones
+			// standing on their toes; a tail that curves and sways. It walks the
+			// way cats do, one leg at a time, hind leg then the front on the
+			// same side. Its fur takes a soft sheen at the edges, and its eyes
+			// catch the light.
 
 			function buildCat() {
-				const fur = new THREE.MeshStandardMaterial({ color: "#09090b", roughness: 0.85 });
+				const fur = new THREE.MeshPhysicalMaterial({ color: "#0b0b0d", roughness: 0.75, sheen: 1, sheenRoughness: 0.45, sheenColor: "#4b4b5a" });
 				const cat = new THREE.Group();
-				const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.4, 1.3, 6, 12), fur);
-				body.rotation.x = Math.PI / 2;
-				body.position.y = 1.3;
-				body.scale.set(1, 1, 0.9);
+				const piece = (geometry, parent, x, y, z) => {
+					const mesh = new THREE.Mesh(geometry, fur);
+					mesh.position.set(x, y, z);
+					parent.add(mesh);
+					return mesh;
+				};
+				// A tapered bone hanging down from a joint.
+				const bone = (top, bottom, length, parent) => piece(new THREE.CylinderGeometry(top, bottom, length, 10).translate(0, -length / 2, 0), parent, 0, 0, 0);
+
+				// Body: lathed along the spine (rump at -z, chest at +z), then
+				// narrowed at the sides, deepened at the chest and tucked at the belly.
+				const body = displace(
+					lathe(
+						[
+							[0.001, -1.0],
+							[0.22, -0.95],
+							[0.33, -0.72],
+							[0.35, -0.45],
+							[0.3, -0.12],
+							[0.33, 0.25],
+							[0.37, 0.55],
+							[0.32, 0.82],
+							[0.18, 0.97],
+							[0.001, 1.02],
+						],
+						24,
+					).rotateX(Math.PI / 2),
+					(x, y, z) => {
+						const deep = 1 + 0.22 * smoothstep(0.1, 0.6, z);
+						const tuck = y < 0 ? 1 - 0.25 * smoothstep(-0.5, 0.1, z) * smoothstep(0.6, -0.1, z) : 1;
+						return [x * 0.82, y * deep * tuck + 0.05 * Math.sin(((z + 1) / 2) * Math.PI), z];
+					},
+				);
+				piece(body, cat, 0, 1.25, -0.05);
+				const neck = piece(new THREE.CylinderGeometry(0.17, 0.27, 0.62, 12), cat, 0, 1.6, 0.92);
+				neck.rotation.x = 0.85;
+
 				const head = new THREE.Group();
-				head.position.set(0, 1.75, 1.2);
-				head.add(new THREE.Mesh(new THREE.SphereGeometry(0.36, 14, 10).scale(1, 0.9, 1), fur));
-				const muzzle = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 8), fur);
-				muzzle.position.set(0, -0.1, 0.3);
-				head.add(muzzle);
+				head.position.set(0, 1.86, 1.18);
+				piece(new THREE.SphereGeometry(0.25, 18, 14).scale(1, 0.86, 1.05), head, 0, 0, 0);
 				for (const side of [-1, 1]) {
-					const ear = new THREE.Mesh(new THREE.ConeGeometry(0.13, 0.32, 4), fur);
-					ear.position.set(side * 0.2, 0.33, -0.02);
-					ear.rotation.z = -side * 0.25;
-					const eye = new THREE.Mesh(new THREE.SphereGeometry(0.055, 8, 6), new THREE.MeshBasicMaterial({ color: "#c9f25a" }));
-					eye.position.set(side * 0.13, 0.04, 0.31);
-					head.add(ear, eye);
+					piece(new THREE.SphereGeometry(0.15, 12, 10), head, side * 0.11, -0.07, 0.07); // cheek
+					const ear = piece(new THREE.ConeGeometry(0.11, 0.27, 4, 1).scale(1, 1, 0.4), head, side * 0.14, 0.24, -0.03);
+					ear.rotation.set(-0.1, side * 0.35, -side * 0.32);
+					const eye = new THREE.Mesh(new THREE.SphereGeometry(0.042, 10, 8).scale(1.3, 0.72, 0.6), new THREE.MeshBasicMaterial({ color: "#a7cc45" }));
+					eye.position.set(side * 0.095, 0.03, 0.205);
+					eye.rotation.z = side * 0.28;
+					const pupil = new THREE.Mesh(new THREE.BoxGeometry(0.01, 0.05, 0.01), new THREE.MeshBasicMaterial({ color: "#000" }));
+					pupil.position.set(side * 0.095, 0.03, 0.232);
+					head.add(eye, pupil);
 				}
+				piece(new THREE.SphereGeometry(0.095, 12, 10).scale(1.1, 0.75, 1), head, 0, -0.09, 0.2); // muzzle
+				cat.add(head);
+
+				// Legs: [x, y, z of the top joint, bones as [top radius, bottom radius,
+				// length, resting angle], hind?]. Angles tip each bone's lower end
+				// backward (+) or forward (-).
 				const legs = [
-					[0.22, 0.75],
-					[-0.22, 0.75],
-					[0.22, -0.65],
-					[-0.22, -0.65],
-				].map(([x, z], i) => {
-					const hip = new THREE.Group();
-					hip.position.set(x, 1.15, z);
-					const leg = new THREE.Mesh(new THREE.CapsuleGeometry(0.1, 0.85, 4, 8), fur);
-					leg.position.y = -0.55;
-					hip.add(leg);
-					cat.add(hip);
-					return { hip, phase: i === 0 || i === 3 ? 0 : Math.PI };
+					[-0.18, 1.3, -0.68, true, 0],
+					[-0.16, 1.15, 0.72, false, 0.5],
+					[0.18, 1.3, -0.68, true, 1],
+					[0.16, 1.15, 0.72, false, 1.5],
+				].map(([x, y, z, hind, step]) => {
+					const bones = hind
+						? [
+								[0.19, 0.11, 0.56, -0.45],
+								[0.095, 0.07, 0.5, 1.1],
+								[0.065, 0.058, 0.38, -0.6],
+							]
+						: [
+								[0.14, 0.095, 0.5, 0.35],
+								[0.078, 0.064, 0.55, -0.35],
+							];
+					const joints = [];
+					let parent = cat;
+					let at = new THREE.Vector3(x, y, z);
+					for (const [top, bottom, length, rest] of bones) {
+						const joint = new THREE.Group();
+						joint.position.copy(at);
+						joint.rotation.x = rest;
+						parent.add(joint);
+						bone(top, bottom, length, joint);
+						joints.push({ joint, rest });
+						parent = joint;
+						at = new THREE.Vector3(0, -length, 0);
+					}
+					piece(new THREE.SphereGeometry(0.07, 10, 8).scale(1, 0.6, 1.4), parent, 0, -bones[bones.length - 1][2], 0.03); // paw
+					return { joints, hind, phase: step * Math.PI };
 				});
-				const tail = Array.from({ length: 9 }, (_, i) => {
-					const piece = new THREE.Mesh(new THREE.SphereGeometry(0.1 - i * 0.006, 8, 6), fur);
-					cat.add(piece);
-					return piece;
-				});
-				cat.add(body, head);
+
+				// Tail: a chain of short tapering pieces from the rump.
+				const tail = [];
+				let parent = cat;
+				let at = new THREE.Vector3(0, 1.45, -1.0);
+				for (let i = 0; i < 14; i++) {
+					const joint = new THREE.Group();
+					joint.position.copy(at);
+					parent.add(joint);
+					const r = 0.075 - i * 0.003;
+					piece(new THREE.CylinderGeometry(r - 0.003, r, 0.14, 8).translate(0, 0.07, 0), joint, 0, 0, 0);
+					tail.push(joint);
+					parent = joint;
+					at = new THREE.Vector3(0, 0.13, 0);
+				}
+
 				cat.userData = { head, legs, tail };
 				return cat;
 			}
@@ -4218,7 +4899,7 @@
 				[0, -31],
 				[-10, -29],
 			].map(([x, z]) => new THREE.Vector3(x, groundY, z));
-			const catState = { leg: 0, from: 0, pause: 2, gait: 0 };
+			const catState = { leg: 0, from: 0, pause: 2, gait: 0, stride: 0 };
 			cat.position.copy(catRoute[0]);
 
 			function updateCat(dt, t) {
@@ -4240,15 +4921,174 @@
 						if (rand() < 0.45) catState.pause = random(3, 7); // stop and stare
 					}
 				}
-				if (walking) catState.gait += dt * 7;
-				for (const { hip, phase } of legs) hip.rotation.x = walking ? 0.45 * Math.sin(catState.gait + phase) : 0;
+				// Each leg swings through its step; on the way forward it lifts,
+				// bending at the knee (hind) or folding back at the wrist (front).
+				catState.stride += ((walking ? 1 : 0) - catState.stride) * Math.min(1, dt * 4);
+				if (walking) catState.gait += dt * 8;
+				for (const { joints, hind, phase } of legs) {
+					const p = catState.gait + phase;
+					const lift = Math.max(0, -Math.cos(p)) * catState.stride;
+					joints[0].joint.rotation.x = joints[0].rest + 0.38 * Math.sin(p) * catState.stride;
+					joints[1].joint.rotation.x = joints[1].rest + (hind ? 0.55 : 0.9) * lift;
+					if (hind) joints[2].joint.rotation.x = joints[2].rest - 0.4 * lift;
+				}
 				// When it stops, it turns its head to look at you.
 				const toCamera = wrapAngle(Math.atan2(camera.position.x - cat.position.x, camera.position.z - cat.position.z) - cat.rotation.y);
 				head.rotation.y += ((walking ? 0 : clamp(toCamera, -1.3, 1.3)) - head.rotation.y) * Math.min(1, dt * 2);
-				tail.forEach((piece, i) => {
-					const k = i / (tail.length - 1);
-					piece.position.set(Math.sin(t * 1.7 + k * 2.5) * 0.35 * k, 1.45 + Math.sin(k * 1.8) * 1.3, -1.05 - Math.cos(k * 1.4) * 0.55 * k - 0.15);
+				head.position.y = 1.86 + 0.03 * Math.sin(catState.gait * 2) * catState.stride;
+				// The tail hangs back, curves up at the end, and sways.
+				tail.forEach((joint, i) => {
+					joint.rotation.x = i === 0 ? -2.3 : 0.17 + 0.04 * Math.sin(t * 0.9 + i * 0.4);
+					joint.rotation.z = 0.09 * Math.sin(t * 1.4 - i * 0.45);
 				});
+			}
+
+			// --- A rat, now and then, across the front of the table --------------
+			// It leaps up at one end, scurries along the front edge, stops once or
+			// twice to sniff, and drops off the other end. It's solid, so it
+			// shoves whatever's in its way.
+
+			function buildRat() {
+				const fur = new THREE.MeshStandardMaterial({ color: "#3a322b", roughness: 0.9 });
+				const skin = new THREE.MeshStandardMaterial({ color: "#a37d74", roughness: 0.6 });
+				const rat = new THREE.Group();
+				rat.rotation.order = "YXZ"; // heading, then nose up or down
+				const body = new THREE.Mesh(
+					displace(new THREE.SphereGeometry(1, 18, 12), (x, y, z) => {
+						const rump = 1 + 0.25 * smoothstep(0.2, -0.6, z); // heavier behind
+						return [x * 0.2 * rump, y * 0.17 * rump + 0.04 * (1 - z * z), z * 0.5];
+					}),
+					fur,
+				);
+				body.position.set(0, 0.17, -0.05);
+				const head = new THREE.Group();
+				head.position.set(0, 0.19, 0.38);
+				const snout = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.42, 14).rotateX(Math.PI / 2), fur);
+				snout.position.z = 0.12;
+				snout.scale.y = 0.85;
+				head.add(snout);
+				const nose = new THREE.Mesh(new THREE.SphereGeometry(0.022, 8, 6), skin);
+				nose.position.z = 0.33;
+				head.add(nose);
+				for (const side of [-1, 1]) {
+					const ear = new THREE.Mesh(new THREE.SphereGeometry(0.06, 10, 8).scale(1, 1, 0.25), skin);
+					ear.position.set(side * 0.09, 0.1, -0.02);
+					ear.rotation.y = side * 0.5;
+					const eye = new THREE.Mesh(new THREE.SphereGeometry(0.02, 8, 6), new THREE.MeshStandardMaterial({ color: "#050403", roughness: 0.1 }));
+					eye.position.set(side * 0.075, 0.05, 0.1);
+					head.add(ear, eye);
+				}
+				const legs = [
+					[-0.13, 0.25],
+					[0.13, 0.25],
+					[-0.15, -0.3],
+					[0.15, -0.3],
+				].map(([x, z], i) => {
+					const hip = new THREE.Group();
+					hip.position.set(x, 0.09, z);
+					const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.024, 0.09, 6).translate(0, -0.045, 0), skin);
+					hip.add(leg);
+					rat.add(hip);
+					return { hip, phase: i < 2 ? 0 : Math.PI }; // a bound: front pair, then back pair
+				});
+				const tail = [];
+				let parent = rat;
+				let at = new THREE.Vector3(0, 0.13, -0.52);
+				for (let i = 0; i < 12; i++) {
+					const joint = new THREE.Group();
+					joint.position.copy(at);
+					joint.rotation.x = i === 0 ? -1.75 : 0.02;
+					parent.add(joint);
+					const r = 0.032 - i * 0.002;
+					joint.add(new THREE.Mesh(new THREE.CylinderGeometry(r - 0.002, r, 0.11, 6).translate(0, 0.055, 0), skin));
+					tail.push(joint);
+					parent = joint;
+					at = new THREE.Vector3(0, 0.1, 0);
+				}
+				rat.add(body, head);
+				rat.scale.setScalar(0.8);
+				rat.userData = { head, legs, tail };
+				return rat;
+			}
+
+			const rat = shadowed(buildRat());
+			rat.visible = false;
+			scene.add(rat);
+			const ratBody = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0, -50, 0));
+			world.createCollider(RAPIER.ColliderDesc.ball(0.09), ratBody);
+			const RAT_Z = 1.36; // along the front edge of the table
+			// It goes around behind the apple and the glass, wherever they are on
+			// the table, rather than knocking them over: [thing, how far its middle
+			// stays from the rat's].
+			const ratAvoids = [
+				[apple, 0.31],
+				[wineGlass, 0.31],
+			];
+			function ratPathZ(x) {
+				const base = RAT_Z + 0.05 * Math.sin(x * 2.7);
+				let z = base;
+				for (const [thing, gap] of ratAvoids) {
+					const { x: tx, y: ty, z: tz } = thing.position;
+					if (ty < -0.1 || ty > 0.6 || Math.abs(tz - base) > gap) continue; // off the table, or out of the way
+					z = Math.min(z, THREE.MathUtils.lerp(base, tz - gap, smoothstep(gap * 3, gap * 1.2, Math.abs(x - tx))));
+				}
+				return z;
+			}
+			const ratState = { wait: random(20, 40), run: null, gait: 0, patter: 0 };
+
+			function updateRat(dt, t) {
+				const state = ratState;
+				if (!state.run) {
+					state.wait -= dt;
+					if (state.wait > 0) return;
+					const dir = rand() < 0.5 ? 1 : -1;
+					state.run = { dir, x: -dir * 2.6, pause: 0, stops: [random(-1.5, -0.3), random(0.3, 1.5)].filter(() => rand() < 0.7) };
+					rat.visible = true;
+				}
+				const run = state.run;
+				const { head, legs, tail } = rat.userData;
+				const moving = run.pause <= 0;
+				if (moving) {
+					const next = run.x + run.dir * 3.2 * dt;
+					const stop = run.stops.findIndex((x) => (x - run.x) * (x - next) <= 0);
+					run.x = next;
+					if (stop >= 0) {
+						run.stops.splice(stop, 1);
+						run.pause = random(0.6, 1.6);
+						sounds.squeak(rat.position);
+					}
+				} else {
+					run.pause -= dt;
+				}
+				// Past either end of the table it's leaping up or dropping off.
+				const over = Math.max(0, Math.abs(run.x) - 2.0);
+				const leaving = Math.sign(run.x) === run.dir;
+				const z = ratPathZ(run.x);
+				rat.position.set(run.x, 0.005 - over * 2.4, z);
+				rat.rotation.y = Math.atan2(run.dir * 0.05, ratPathZ(run.x + run.dir * 0.05) - z);
+				rat.rotation.x = clamp(over * 4, 0, 1) * (leaving ? 1.2 : -1.2);
+				if (over > 0.6 && leaving) {
+					state.run = null;
+					state.wait = random(25, 60);
+					rat.visible = false;
+					ratBody.setNextKinematicTranslation({ x: 0, y: -50, z: 0 });
+					return;
+				}
+				ratBody.setNextKinematicTranslation({ x: rat.position.x, y: rat.position.y + 0.09, z: rat.position.z });
+
+				if (moving) {
+					state.gait += dt * 32;
+					state.patter -= dt;
+					if (state.patter < 0) {
+						sounds.patter(rat.position);
+						state.patter = 0.06;
+					}
+				}
+				rat.position.y += moving ? 0.03 * Math.abs(Math.sin(state.gait)) : 0;
+				for (const { hip, phase } of legs) hip.rotation.x = moving ? 0.7 * Math.sin(state.gait + phase) : 0;
+				head.rotation.x = moving ? 0 : 0.15 * Math.sin(t * 22) - 0.1; // sniffing
+				head.rotation.y = moving ? 0 : 0.4 * Math.sin(t * 2.5);
+				tail.forEach((joint, i) => i && (joint.rotation.y = 0.22 * Math.sin(t * (moving ? 14 : 4) - i * 0.6)));
 			}
 
 			// --- Everything out there, per frame ----------------------------------
@@ -4378,9 +5218,10 @@
 			// Camera
 			// Front-facing only. When left alone, the camera drifts slowly from
 			// side to side and turns back well before it gets around the pumpkin.
+			// You can tip it down far enough to look up under the table.
 			// =====================================================================
 
-			const SWING = 0.65; // how far you can orbit to either side (radians)
+			const SWING = 0.9; // how far you can orbit to either side (radians)
 			const SWEEP = 0.26; // how far the idle drift goes
 			controls.minAzimuthAngle = turn - SWING;
 			controls.maxAzimuthAngle = turn + SWING;
@@ -4389,6 +5230,36 @@
 			pumpkin.updateMatrixWorld(true);
 			flame.getWorldPosition(controls.target).y += 0.05;
 			camera.position.set(Math.sin(turn) * 5 + 0.3, controls.target.y + 0.85, Math.cos(turn) * 5);
+			const cameraHome = camera.position.clone();
+
+			// Far enough out, you can tip down below the tabletop and look up at
+			// its underside, but never through the ground. Once under, you can
+			// move in until you're just below the table; to come back up, move
+			// out first. Either way you never pass through the table.
+			controls.minPolarAngle = 0.12 * Math.PI;
+			controls.maxPolarAngle = 0.9 * Math.PI; // the same at any zoom
+			// Under the table, you can't zoom in up through it.
+			function limitZoom() {
+				const offset = camera.position.clone().sub(controls.target);
+				const below = controls.target.y + 0.55; // from the flame down to just under the table
+				controls.minDistance = camera.position.y < -0.5 ? below / Math.max(0.3, -offset.y / offset.length()) : 0.25;
+			}
+
+			// Turning down past the ground slides the camera in toward the flame,
+			// along its line of sight, instead of into the ground, and back out to
+			// where it was as you turn up again.
+			let groundHeld = 0; // how far out the camera wants to be while the ground holds it in
+			function releaseGround() {
+				if (groundHeld) camera.position.sub(controls.target).setLength(groundHeld).add(controls.target);
+				groundHeld = 0;
+			}
+			function holdAboveGround() {
+				const floor = groundY + 0.3;
+				if (camera.position.y >= floor) return;
+				const offset = camera.position.clone().sub(controls.target);
+				groundHeld = offset.length();
+				camera.position.copy(controls.target).addScaledVector(offset, (controls.target.y - floor) / -offset.y);
+			}
 
 			const sweep = { idle: 0, velocity: 0, direction: 1, dragging: false };
 			controls.addEventListener("start", () => {
@@ -4564,7 +5435,6 @@
 				quality.checkAt = t + 3;
 				if (quality.frameTime < 1 / 40) return;
 				quality.level--;
-				if (quality.level === 1) renderer.setPixelRatio(1);
 				if (quality.level === 0) {
 					bloom.enabled = false;
 					clusterLight.castShadow = false;
@@ -4649,11 +5519,14 @@
 			// Sound
 			// All synthesized with the Web Audio API, no files. Underneath, a low
 			// beating drone; around it, wind that swells with the gusts that bend
-			// the flames and sometimes moans, crickets that stop all at once, an
-			// owl, a far-off bell, creaking wood, whispers just out of view. Up
-			// close: candle crackle, the cauldron, bats, the doll's music box, and
-			// knocks when things land. Inside the pumpkin everything goes muffled
-			// and you can hear a heartbeat.
+			// the flames and sometimes moans, crickets and katydids that stop all
+			// at once, an owl, a far-off bell, creaking wood, whispers just out of
+			// view, laughter, a woman humming in the fog, the cat, footsteps in
+			// the leaves behind you, and now and then a few soft notes from the
+			// piano. Up close: candle crackle, the
+			// cauldron, bats, the doll's music box, the rat, and knocks when
+			// things land. Inside the pumpkin everything goes muffled and you can
+			// hear a heartbeat.
 			// Browsers only allow sound after an interaction, so it starts on the
 			// first click, tap or key press. The button in the corner mutes.
 			// =====================================================================
@@ -4683,6 +5556,18 @@
 				let nextCreak = 0;
 				let nextBeat = 0;
 				let nextSilence = 0;
+				let nextLaugh = 0;
+				let nextVoice = 0;
+				let nextMeow = 0;
+				let nextSteps = 0;
+				let nextKatydid = 0;
+				let katydidSide = 1;
+				let nextPiano = 0;
+				let songUntil = 0;
+				let pianoWave;
+				let pianoWarble; // a pitch wobble every piano string shares
+				const pianoTuning = new Map(); // how far out of tune each key is, in cents
+				const LULLABY = [69, 72, 76, 74, 72, 71, 69, 64, 69];
 				const changed = []; // called when sound turns on or off
 				const notify = () => changed.forEach((fn) => fn());
 				const facing = new THREE.Vector3();
@@ -4831,7 +5716,7 @@
 						const panner = ctx.createStereoPanner();
 						panner.pan.value = pan;
 						oscillator.connect(level).connect(panner);
-						route(panner, { wet: 0.5, gain: 0.04 });
+						route(panner, { wet: 0.5, gain: 0.01 });
 						oscillator.start();
 						crickets.push({ level, next: ctx.currentTime + Math.random() * 2, period: 0.55 + Math.random() * 0.35 });
 					}
@@ -4883,7 +5768,360 @@
 					nextBell = now + 40 + Math.random() * 40;
 					nextCreak = now + 10 + Math.random() * 20;
 					nextSilence = now + 30 + Math.random() * 40;
+					nextLaugh = now + 30 + Math.random() * 40;
+					nextVoice = now + 50 + Math.random() * 50;
+					nextMeow = now + 15 + Math.random() * 25;
+					nextSteps = now + 60 + Math.random() * 60;
+					nextKatydid = now + 3;
+					nextPiano = now + 20 + Math.random() * 30;
 					notify();
+				}
+
+				// A point a little way off, mostly behind you.
+				function behind(distance) {
+					camera.getWorldDirection(facing);
+					const away = Math.atan2(-facing.x, -facing.z) + (Math.random() - 0.5) * 2.4;
+					return camera.position.clone().add(new THREE.Vector3(Math.sin(away) * distance, Math.random() * 0.6 - 0.3, Math.cos(away) * distance));
+				}
+
+				// A voice: a buzzing throat (a sawtooth, with a little breath) through
+				// three resonances of the mouth. pitch and vowels are [seconds,
+				// value] steps to glide through; beats chops it into syllables
+				// ([start, length] each), "ha-ha-ha".
+				const VOWELS = { a: [800, 1150, 2900], o: [450, 800, 2830], u: [325, 700, 2530], i: [270, 2290, 3010], e: [400, 1700, 2600], m: [250, 1100, 2200] };
+				function vocal({ at, ref = 4, wet = 0.5, gain = 0.3, length, pitch, vowels, beats = [[0, length]], vibrato = 5.5, breath = 0.2 }) {
+					const t0 = ctx.currentTime + 0.02;
+					const throat = ctx.createOscillator();
+					throat.type = "sawtooth";
+					throat.frequency.setValueAtTime(pitch[0][1], t0);
+					for (const [t, f] of pitch) throat.frequency.linearRampToValueAtTime(f, t0 + t);
+					const wobble = ctx.createOscillator();
+					wobble.frequency.value = vibrato;
+					const wobbleDepth = ctx.createGain();
+					wobbleDepth.gain.value = 30; // cents
+					wobble.connect(wobbleDepth).connect(throat.detune);
+					const air = ctx.createBufferSource();
+					air.buffer = noise;
+					air.loop = true;
+					const airLevel = ctx.createGain();
+					airLevel.gain.value = breath;
+					air.connect(airLevel);
+					const mouth = ctx.createGain();
+					mouth.gain.setValueAtTime(0, t0);
+					[
+						[1, 6],
+						[0.5, 9],
+						[0.25, 12],
+					].forEach(([level, q], k) => {
+						const formant = ctx.createBiquadFilter();
+						formant.type = "bandpass";
+						formant.Q.value = q;
+						formant.frequency.setValueAtTime(VOWELS[vowels[0][1]][k], t0);
+						for (const [t, v] of vowels) formant.frequency.linearRampToValueAtTime(VOWELS[v][k], t0 + t);
+						const amount = ctx.createGain();
+						amount.gain.value = level;
+						throat.connect(formant);
+						airLevel.connect(formant);
+						formant.connect(amount).connect(mouth);
+					});
+					for (const [start, span] of beats) {
+						mouth.gain.setValueAtTime(0, t0 + start);
+						mouth.gain.linearRampToValueAtTime(1, t0 + start + Math.min(0.05, span * 0.3));
+						mouth.gain.setTargetAtTime(0, t0 + start + span * 0.6, span * 0.15);
+					}
+					route(mouth, { position: at, ref, wet, gain });
+					for (const node of [throat, wobble, air]) {
+						node.start(t0, node === air ? Math.random() * 1.5 : 0);
+						node.stop(t0 + length + 0.6);
+					}
+				}
+
+				// Laughter: a witch's cackle far off in the trees, a low chuckle just
+				// behind you, or a little girl's giggle from where the doll sits.
+				function laugh() {
+					const kind = Math.floor(Math.random() * 3);
+					const count = [9, 5, 6][kind] + Math.floor(Math.random() * 4);
+					const gap = [0.14, 0.22, 0.12][kind];
+					const beats = Array.from({ length: count }, (_, i) => [i * gap * (1 + i * 0.04), gap * 0.75]);
+					const length = beats[count - 1][0] + gap;
+					const [high, low] = [
+						[640, 380],
+						[125, 82],
+						[560, 720],
+					][kind];
+					const vowel = ["i", "o", "i"][kind];
+					const at = [new THREE.Vector3(-30 + Math.random() * 60, 4, -25 - Math.random() * 15), behind(2.5), doll.userData.head.getWorldPosition(new THREE.Vector3())][kind];
+					vocal({
+						at,
+						ref: [8, 1.5, 2][kind],
+						wet: [0.8, 0.35, 0.55][kind],
+						gain: [0.8, 0.4, 0.22][kind],
+						length,
+						pitch: [
+							[0, high],
+							[length, low],
+						],
+						vowels: [
+							[0, vowel],
+							[length, kind === 0 ? "a" : vowel],
+						],
+						beats,
+						vibrato: [9, 4, 7][kind],
+						breath: [0.35, 0.25, 0.4][kind],
+					});
+				}
+
+				// Out in the fog: a woman humming the doll's lullaby, slow and low,
+				// or a long wordless moan.
+				function ghostVoice() {
+					const at = new THREE.Vector3(-25 + Math.random() * 50, 2, -15 - Math.random() * 25);
+					if (Math.random() < 0.5) {
+						const notes = LULLABY.slice(0, 5 + Math.floor(Math.random() * 5));
+						const step = 0.75;
+						const length = notes.length * step;
+						const pitch = notes.flatMap((note, i) => {
+							const f = 440 * Math.pow(2, (note - 81) / 12);
+							return [
+								[i * step + 0.08, f],
+								[(i + 0.85) * step, f],
+							];
+						});
+						vocal({ at, ref: 8, wet: 0.85, gain: 0.55, length, pitch, vowels: [[0, "m"], [length * 0.6, "u"], [length, "m"]], vibrato: 5, breath: 0.3 });
+					} else {
+						vocal({
+							at,
+							ref: 8,
+							wet: 0.85,
+							gain: 0.5,
+							length: 4.8,
+							pitch: [
+								[0, 170],
+								[1.5, 235],
+								[3, 205],
+								[4.8, 140],
+							],
+							vowels: [
+								[0, "u"],
+								[1.5, "o"],
+								[3, "a"],
+								[4.8, "u"],
+							],
+							vibrato: 4.5,
+							breath: 0.35,
+						});
+					}
+				}
+
+				// The cat, out among the stones: a meow, or the long yowl that
+				// sounds like a baby crying. Startle it and it hisses.
+				const catMouth = () => cat.userData.head.getWorldPosition(new THREE.Vector3());
+				function meow() {
+					const yowl = Math.random() < 0.4;
+					const length = yowl ? 2.2 + Math.random() : 0.9 + Math.random() * 0.4;
+					vocal({
+						at: catMouth(),
+						ref: 6,
+						wet: 0.6,
+						gain: 0.7,
+						length,
+						pitch: yowl
+							? [
+									[0, 520],
+									[0.4, 820],
+									[length * 0.6, 760],
+									[length, 480],
+								]
+							: [
+									[0, 600],
+									[0.25, 820],
+									[length, 500],
+								],
+						vowels: [
+							[0, "m"],
+							[0.15, "i"],
+							[length * 0.45, "a"],
+							[length * 0.8, "o"],
+							[length, "u"],
+						],
+						vibrato: yowl ? 7 : 5,
+						breath: 0.15,
+					});
+				}
+
+				function hiss() {
+					burst({ position: catMouth(), filter: "highpass", frequency: 3000, peak: 0.6, attack: 0.03, decay: 0.9, wet: 0.4, ref: 6 });
+				}
+
+				// Slow footsteps through dead leaves somewhere behind you, coming
+				// closer... and then they stop.
+				function footsteps() {
+					camera.getWorldDirection(facing);
+					const away = Math.atan2(-facing.x, -facing.z) + (Math.random() - 0.5) * 1.2;
+					const steps = 5 + Math.floor(Math.random() * 4);
+					for (let i = 0; i < steps; i++) {
+						const distance = 10 - (i / steps) * 6;
+						const at = camera.position.clone().add(new THREE.Vector3(Math.sin(away) * distance, -1.5, Math.cos(away) * distance));
+						const delay = i * (0.62 + Math.random() * 0.12);
+						burst({ position: at, filter: "lowpass", frequency: 300, peak: 0.5, attack: 0.005, decay: 0.09, wet: 0.3, ref: 2, delay });
+						for (let k = 0; k < 6; k++) {
+							burst({ position: at, filter: "bandpass", frequency: 2000 + Math.random() * 3000, q: 1.5, peak: 0.12 + Math.random() * 0.18, attack: 0.002, decay: 0.02 + Math.random() * 0.03, wet: 0.25, ref: 2, delay: delay + 0.02 + Math.random() * 0.15 });
+						}
+					}
+				}
+
+				// The old piano, a little out of tune: each note is two strings a few
+				// cents apart, bright when struck and mellowing as it rings, with the
+				// thump of the hammer.
+				function pianoNote(midi, { delay = 0, velocity = 0.5, length = 4, ref = 6, spread = 3 } = {}) {
+					if (!pianoWave) {
+						const real = new Float32Array(24);
+						const imag = real.map((_, n) => (n ? Math.pow(n, -1.1) * (n === 7 || n === 8 ? 0.3 : 1) : 0));
+						pianoWave = ctx.createPeriodicWave(real, imag);
+					}
+					if (!pianoWarble) {
+						// Everything it plays is flat and wobbles in pitch, slow swoops and
+						// a faster flutter, like a record played too slow.
+						pianoWarble = ctx.createGain();
+						for (const [rate, cents] of [
+							[0.09, 60],
+							[0.31, 30],
+							[4.5, 7],
+						]) {
+							const lfo = ctx.createOscillator();
+							lfo.frequency.value = rate;
+							const depth = ctx.createGain();
+							depth.gain.value = cents;
+							lfo.connect(depth).connect(pianoWarble);
+							lfo.start();
+						}
+					}
+					if (!pianoTuning.has(midi)) pianoTuning.set(midi, (Math.random() - 0.5) * 30);
+					const t = ctx.currentTime + delay;
+					const frequency = 440 * Math.pow(2, (midi - 69) / 12);
+					const ring = Math.max(0.45, Math.min(length, 1.5 + 4 * Math.sqrt(220 / frequency)));
+					const tone = ctx.createBiquadFilter();
+					tone.type = "lowpass";
+					tone.frequency.setValueAtTime(Math.min(16000, frequency * (3 + 10 * velocity)), t);
+					tone.frequency.exponentialRampToValueAtTime(Math.max(250, frequency * 1.5), t + ring * 0.6);
+					const level = ctx.createGain();
+					level.gain.setValueAtTime(0.0001, t);
+					level.gain.exponentialRampToValueAtTime(velocity * 0.22, t + 0.006);
+					level.gain.exponentialRampToValueAtTime(velocity * 0.07, t + 0.35);
+					level.gain.exponentialRampToValueAtTime(0.0001, t + ring);
+					for (const side of [-1, 1]) {
+						const string = ctx.createOscillator();
+						string.setPeriodicWave(pianoWave);
+						string.frequency.value = frequency;
+						string.detune.value = pianoTuning.get(midi) + side * spread - 180;
+						pianoWarble.connect(string.detune);
+						string.onended = () => pianoWarble.disconnect(string.detune);
+						string.connect(tone);
+						string.start(t);
+						string.stop(t + ring + 0.1);
+					}
+					tone.connect(level);
+					const at = piano.userData.soundAt;
+					route(level, { position: at, wet: 0.45, ref });
+					burst({ position: at, filter: "lowpass", frequency: frequency * 2 + 300, peak: velocity * 0.18, attack: 0.001, decay: 0.03, wet: 0.2, ref, delay });
+				}
+
+				// Click the piano: an old saloon rag, the first strain of Joplin's
+				// "The Entertainer", jangly on strings long out of tune. The tune is
+				// [note, sixteenths] (0 for a rest), starting two sixteenths before
+				// the first bar. The left hand strides, a bass note then a chord on
+				// each beat (two to a bar): the root, or the fifth when the chord
+				// carries on from the beat before.
+				const RAG_TUNE = [
+					[74, 1], [75, 1],
+					[76, 1], [84, 2], [76, 1], [84, 2], [76, 1], [84, 3],
+					[84, 1], [86, 1], [87, 1], [88, 1], [84, 1], [86, 1],
+					[88, 2], [83, 1], [86, 2], [84, 3],
+					[0, 6], [74, 1], [75, 1],
+					[76, 1], [84, 2], [76, 1], [84, 2], [76, 1], [84, 3],
+					[81, 1], [79, 1], [78, 1], [81, 1], [84, 1], [88, 2],
+					[86, 1], [84, 1], [81, 1], [86, 4],
+					[0, 6], [74, 1], [75, 1],
+					[76, 1], [84, 2], [76, 1], [84, 2], [76, 1], [84, 3],
+					[84, 1], [86, 1], [87, 1], [88, 1], [84, 1], [86, 1],
+					[88, 2], [83, 1], [86, 2], [84, 3],
+				];
+				const RAG_CHORDS = "C C C C G7 C C C C C C D7 D7 D7 G7 G7 C C C C G7 C".split(" ");
+				const STRIDE = { C: [36, 43, [52, 55, 60]], G7: [43, 38, [53, 59, 62]], D7: [38, 45, [54, 57, 60]] }; // root, fifth, chord
+
+				// Both hands as [time, note, velocity, length], at a given sixteenth.
+				function ragNotes(sixteenth) {
+					const tune = [];
+					let at = -2;
+					for (const [note, length] of RAG_TUNE) {
+						if (note) tune.push([at * sixteenth, note, 0.34, length * sixteenth + 0.3]);
+						at += length;
+					}
+					const left = [];
+					RAG_CHORDS.forEach((name, beat) => {
+						const [root, fifth, chord] = STRIDE[name];
+						const t = beat * 4 * sixteenth;
+						const bass = beat % 2 && RAG_CHORDS[beat - 1] === name ? fifth : root;
+						left.push([t, bass, 0.26, 3.5 * sixteenth], [t, bass + 12, 0.13, 3.5 * sixteenth]);
+						for (const note of chord) left.push([t + 2 * sixteenth, note, 0.13, 1.8 * sixteenth]);
+					});
+					return { tune, left, end: RAG_CHORDS.length * 4 * sixteenth };
+				}
+
+				function playRag(notes, start, spread) {
+					for (const [time, note, velocity, length] of notes) {
+						// Handed to the audio clock a moment ahead, so it isn't flooded all at once.
+						setTimeout(() => pianoNote(note, { delay: Math.max(0, start + time - ctx.currentTime), velocity, length, spread }), Math.max(0, (start + time - ctx.currentTime - 0.6) * 1000));
+					}
+				}
+
+				function pianoSong() {
+					if (ctx.currentTime < songUntil) return;
+					const { tune, left, end } = ragNotes(0.28); // slow, like a music box winding down
+					const octaves = tune.map(([time, note, velocity, length]) => [time + 0.004, note + 12, velocity * 0.35, length]);
+					const ending = [36, 48, 52, 55, 60, 72, 84].map((note) => [end, note, 0.3, 5]);
+					const start = ctx.currentTime + 0.4;
+					playRag([...tune, ...octaves, ...left, ...ending], start, 12);
+					songUntil = start + end + 3;
+				}
+
+				// Now and then, softly and slower, a couple of bars of the tune, as
+				// if someone were picking it out in the dark.
+				function pianoDrift() {
+					if (ctx.currentTime < songUntil) return;
+					const sixteenth = 0.4;
+					const from = Math.floor(Math.random() * 10) * 8 * sixteenth;
+					const bars = ragNotes(sixteenth).tune.filter(([time]) => time >= from && time < from + 16 * sixteenth);
+					const start = ctx.currentTime + 0.1 - from;
+					playRag(bars.map(([time, note, , length]) => [time, note, 0.1 + Math.random() * 0.05, length]), start, 9);
+				}
+
+				// Both forearms brought down hard on the keys.
+				function pianoSlam() {
+					if (muted) return;
+					for (let i = 0; i < 14; i++) pianoNote(24 + Math.floor(Math.random() * 30), { delay: Math.random() * 0.03, velocity: 0.9 + Math.random() * 0.1, length: 6, ref: 14 });
+					burst({ position: piano.userData.soundAt, filter: "lowpass", frequency: 180, peak: 1, attack: 0.002, decay: 0.4, wet: 0.5, ref: 14 });
+				}
+
+				// A drawer dragged along dry runners: a rasp for each bit it moves,
+				// and a knock when it hits a stop.
+				function scrape(position) {
+					burst({ position, filter: "bandpass", frequency: 550 + Math.random() * 200, q: 1.2, peak: 0.15 + Math.random() * 0.2, attack: 0.005, decay: 0.06, wet: 0.25, ref: 2 });
+				}
+
+				function knock(position) {
+					burst({ position, filter: "bandpass", frequency: 700, q: 1.2, peak: 0.5, attack: 0.002, decay: 0.08, ref: 2 });
+					tone({ position, from: 160, to: 120, glide: 0.08, peak: 0.4, attack: 0.002, decay: 0.12, ref: 2 });
+				}
+
+				// The rat: a squeak or two, and the patter of its claws on the boards.
+				function squeak(position) {
+					for (let i = 0, count = 1 + Math.floor(Math.random() * 3); i < count; i++) {
+						tone({ position, from: 3200 + Math.random() * 1500, to: 2600 + Math.random() * 800, glide: 0.06, peak: 0.12, attack: 0.005, decay: 0.07, wet: 0.2, ref: 1.5, delay: i * 0.12 });
+					}
+				}
+
+				function patter(position) {
+					burst({ position, filter: "bandpass", frequency: 4000 + Math.random() * 2000, q: 3, peak: 0.1, attack: 0.001, decay: 0.012, wet: 0.1, ref: 1 });
 				}
 
 				// Wind that rises into a moan: noise through a narrow, gliding filter.
@@ -4943,10 +6181,7 @@
 						t += length + (Math.random() < 0.2 ? 0.15 + Math.random() * 0.25 : 0.01);
 					}
 					voice.gain.exponentialRampToValueAtTime(0.0001, t + 0.1);
-					camera.getWorldDirection(facing);
-					const away = Math.atan2(-facing.x, -facing.z) + (Math.random() - 0.5) * 2.4; // mostly behind you
-					const at = camera.position.clone().add(new THREE.Vector3(Math.sin(away) * 2.5, Math.random() * 0.6 - 0.3, Math.cos(away) * 2.5));
-					route(voice, { position: at, wet: 0.5, gain: 0.3, ref: 1.5 });
+					route(voice, { position: behind(2.5), wet: 0.5, gain: 0.3, ref: 1.5 });
 					source.start(t0, Math.random() * 1.5);
 					source.stop(t + 0.2);
 				}
@@ -5062,7 +6297,7 @@
 					musicUntil = ctx.currentTime + 8;
 					const at = doll.userData.head.getWorldPosition(new THREE.Vector3());
 					let delay = 0;
-					[69, 72, 76, 74, 72, 71, 69, 64, 69].forEach((note, i) => {
+					LULLABY.forEach((note, i) => {
 						const wobble = 1 + 0.015 * Math.sin(i * 1.7); // the drum turning unevenly
 						const frequency = 880 * wobble * Math.pow(2, (note - 69 + (Math.random() - 0.5) * 0.7 - i * 0.04) / 12);
 						for (const [ratio, peak] of [
@@ -5276,6 +6511,37 @@
 						hushUntil = Math.max(hushUntil, now + 5 + Math.random() * 5);
 						nextSilence = now + 40 + Math.random() * 50;
 					}
+					// Katydids rasp back and forth across the dark, and hush with the crickets.
+					if (now > nextKatydid) {
+						if (now > hushUntil) {
+							katydidSide = -katydidSide;
+							const at = new THREE.Vector3(katydidSide * (8 + Math.random() * 6), groundY + 1, -6 - Math.random() * 8);
+							for (let i = 0, count = 2 + Math.floor(Math.random() * 2); i < count; i++) {
+								burst({ position: at, filter: "bandpass", frequency: 5500 + Math.random() * 800, q: 2.5, peak: 0.08, attack: 0.01, decay: 0.07, wet: 0.35, ref: 3, delay: i * 0.16 });
+							}
+						}
+						nextKatydid = now + (Math.random() < 0.75 ? 0.9 + Math.random() * 0.6 : 6 + Math.random() * 10);
+					}
+					if (now > nextLaugh) {
+						laugh();
+						nextLaugh = now + 70 + Math.random() * 80;
+					}
+					if (now > nextVoice) {
+						ghostVoice();
+						nextVoice = now + 80 + Math.random() * 90;
+					}
+					if (now > nextMeow) {
+						meow();
+						nextMeow = now + 35 + Math.random() * 60;
+					}
+					if (now > nextSteps) {
+						footsteps();
+						nextSteps = now + 90 + Math.random() * 120;
+					}
+					if (now > nextPiano) {
+						pianoDrift();
+						nextPiano = now + 35 + Math.random() * 60;
+					}
 
 					// Inside the pumpkin: muffled, and a heartbeat.
 					const inside = camera.position.distanceTo(pumpkinCenter) < Math.min(W, H) * 0.95;
@@ -5286,7 +6552,34 @@
 					}
 				}
 
-				return { start, update, puff, impact, musicBox, witchPasses, scream, skitter, pour, setMuted, playing, started: () => !!ctx, muted: () => muted, onChange: (fn) => changed.push(fn) };
+				// For things that happen in the scene: only once sound is running.
+				const live =
+					(fn) =>
+					(...args) =>
+						ctx?.state === "running" && fn(...args);
+
+				return {
+					start,
+					update,
+					puff,
+					impact,
+					musicBox,
+					witchPasses,
+					scream,
+					skitter,
+					pour,
+					hiss: live(hiss),
+					pianoSong: live(pianoSong),
+					pianoSlam: live(pianoSlam),
+					scrape: live(scrape), knock: live(knock),
+					squeak: live(squeak),
+					patter: live(patter),
+					setMuted,
+					playing,
+					started: () => !!ctx,
+					muted: () => muted,
+					onChange: (fn) => changed.push(fn),
+				};
 			})();
 
 			for (const type of ["pointerdown", "keydown", "touchstart"]) {
@@ -5605,7 +6898,8 @@
 			// =====================================================================
 			// The jump scare
 			// The doll: click her and she blinks and her music box plays; click her
-			// a third time and she comes straight at you, then it starts over.
+			// a third time and she comes straight at you, as somebody brings
+			// their arms down on the piano keys, then it starts over.
 			// And one of the spiders (which one depends on the seed) comes at you
 			// every time. The other creatures just react to being clicked.
 			// =====================================================================
@@ -5642,6 +6936,7 @@
 				source.visible = false; // it's not where it was any more
 				scare = { rig, source, time: 0, stop };
 				sounds.scream();
+				sounds.pianoSlam(); // and somebody slams the piano
 			}
 
 			function updateScare(dt) {
@@ -5748,7 +7043,10 @@
 
 			// What they do when clicked (and what the doll does the first two times).
 			const reactions = {
-				cat: () => (catState.pause = Math.max(catState.pause, 4)), // stops and stares
+				cat: () => {
+					catState.pause = Math.max(catState.pause, 4); // stops, stares and hisses
+					sounds.hiss();
+				},
 				witch: () => sounds.witchPasses(),
 				vulture: () => (vulture.userData.spread = 3),
 				bat: (roost) => roost && startle(roost), // a roosting bat takes off
@@ -5766,7 +7064,7 @@
 			let dollClicks = 0;
 			const scarySpider = spiders[Math.floor(mulberry32(settings.seed + 13)() * spiders.length)];
 			function creatureClicked(kind, object, extra) {
-				const scares = (kind === "doll" && ++dollClicks % 3 === 0) || (kind === "spider" && extra === scarySpider);
+				const scares = (kind === "doll" && dollClicks++ % 3 === 0) || (kind === "spider" && extra === scarySpider);
 				if (scares && kind === "spider") spiderSwarm(object);
 				else if (scares) jumpScare(kind, object);
 				else reactions[kind](extra);
@@ -5789,87 +7087,406 @@
 			interactives.find((entry) => entry.object === doll).onClick = () => creatureClicked("doll", doll);
 
 			// =====================================================================
-			// Hint
+			// How to look around
+			// When the page opens, a card in the middle shows the two gestures, in
+			// turn: a finger dragging side to side (look around), then two
+			// fingers spreading apart (pinch, or scroll, to move in). It fades
+			// as soon as you start, or after a few seconds.
 			// =====================================================================
 
-			const hint = document.createElement("div");
-			hint.textContent =
-				innerWidth < 600 ? "Drag to Look · Pinch to Move In · Tap a Flame" : "Drag to Look Around · Scroll or Pinch to Move In · Drag Things on the Table · Click or Tap a Flame";
-			Object.assign(hint.style, {
-				position: "fixed",
-				bottom: "14px",
-				left: "120px", // clear of the frame rate and the maker's mark in the corners
-				right: "120px",
-				textAlign: "center",
-				pointerEvents: "none",
-				color: "#c9b9a0",
-				font: "13px system-ui, sans-serif",
-				opacity: "0.6",
-				transition: "opacity 2s",
-			});
-			document.body.appendChild(hint);
-			setTimeout(() => (hint.style.opacity = "0"), 7000);
+			const coarse = matchMedia("(pointer: coarse)").matches;
+			const guideStyles = document.createElement("style");
+			guideStyles.textContent = `
+				.guide {
+					position: fixed;
+					left: 50%;
+					top: 50%;
+					transform: translate(-50%, -50%);
+					box-sizing: border-box;
+					width: max-content;
+					max-width: calc(100vw - 32px);
+					display: grid;
+					justify-items: center;
+					gap: 8px;
+					padding: 18px 22px 16px;
+					border: 1px solid rgba(255, 190, 120, 0.18);
+					border-radius: 18px;
+					background: rgba(12, 10, 8, 0.5);
+					backdrop-filter: blur(6px);
+					color: #e8d8bf;
+					font: 14px/1.35 system-ui, sans-serif;
+					text-align: center;
+					pointer-events: none;
+					transition: opacity 1.2s;
+				}
+				.guide.is-gone {
+					opacity: 0;
+				}
+				.guide svg {
+					display: block;
+					width: 132px;
+					height: 92px;
+					overflow: visible;
+				}
+				.guide p {
+					margin: 0;
+				}
+				.guide__more {
+					font-size: 12px;
+					opacity: 0.6;
+				}
+				.guide__drag {
+					animation: guide-drag-show 5s infinite;
+				}
+				.guide__hand {
+					animation: guide-drag 5s infinite ease-in-out;
+				}
+				.guide__pinch {
+					opacity: 0;
+					animation: guide-pinch-show 5s infinite;
+				}
+				.guide__finger-a {
+					animation: guide-spread-a 5s infinite ease-in-out;
+				}
+				.guide__finger-b {
+					animation: guide-spread-b 5s infinite ease-in-out;
+				}
+				@keyframes guide-drag-show {
+					0%, 44% { opacity: 1; }
+					50%, 94% { opacity: 0; }
+					100% { opacity: 1; }
+				}
+				@keyframes guide-pinch-show {
+					0%, 44% { opacity: 0; }
+					50%, 94% { opacity: 1; }
+					100% { opacity: 0; }
+				}
+				@keyframes guide-drag {
+					0%, 4% { transform: translateX(0); }
+					16% { transform: translateX(-18px); }
+					34% { transform: translateX(18px); }
+					44%, 100% { transform: translateX(0); }
+				}
+				@keyframes guide-spread-a {
+					0%, 54% { transform: translate(0, 0); }
+					82%, 100% { transform: translate(-15px, 15px); }
+				}
+				@keyframes guide-spread-b {
+					0%, 54% { transform: translate(0, 0); }
+					82%, 100% { transform: translate(15px, -15px); }
+				}
+				@media (prefers-reduced-motion: reduce) {
+					.guide * {
+						animation: none !important;
+					}
+				}
+			`;
+			document.head.appendChild(guideStyles);
+
+			// A pointing hand (the fingertip at 21, 3), drawn once and reused.
+			const HAND = '<path d="M18 27V6a3 3 0 0 1 6 0v13a3 3 0 0 1 6 0v2a3 3 0 0 1 6 0v2a2.5 2.5 0 0 1 5 0v10c0 7-4 11-10 11h-6c-3 0-5-1.5-7-4l-6.6-8.4a2.4 2.4 0 0 1 3.6-3.2L18 31z" fill="rgba(232, 216, 191, 0.12)" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>';
+			const TOUCH = '<circle r="5.5" fill="currentColor" opacity="0.85"/><circle r="9.5" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.45"/>';
+			const guide = document.createElement("div");
+			guide.className = "guide";
+			guide.setAttribute("role", "note");
+			guide.innerHTML = `
+				<svg viewBox="0 0 132 92" aria-hidden="true">
+					<g class="guide__drag">
+						<path d="M30 30l-7 6 7 6M102 30l7 6-7 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" opacity="0.6"/>
+						<g class="guide__hand"><g transform="translate(66 36)">${TOUCH}</g><g transform="translate(43 33) scale(1.15)">${HAND}</g></g>
+					</g>
+					<g class="guide__pinch">
+						<path d="M41 61L91 11" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2 4" stroke-linecap="round" opacity="0.5"/>
+						<g class="guide__finger-a"><g transform="translate(58 44)">${TOUCH}</g></g>
+						<g class="guide__finger-b"><g transform="translate(74 28)">${TOUCH}</g></g>
+					</g>
+				</svg>
+				<p>${coarse ? "Drag to Look Around · Pinch to Move In" : "Drag to Look Around · Scroll or Pinch to Move In"}</p>
+				<p class="guide__more">${coarse ? "Tap Things · Drag Things on the Table" : "Click Things · Drag Things on the Table"}</p>
+			`;
+			document.body.appendChild(guide);
+			function dismissGuide() {
+				guide.classList.add("is-gone");
+				setTimeout(() => guide.remove(), 1300);
+				for (const type of ["pointerdown", "wheel", "keydown"]) removeEventListener(type, dismissGuide, { capture: true });
+			}
+			for (const type of ["pointerdown", "wheel", "keydown"]) addEventListener(type, dismissGuide, { capture: true });
+			setTimeout(dismissGuide, 9000);
 
 			// =====================================================================
-			// Maker's mark and frame rate
-			// The mark from the footer of hemm.ing (as in closer-to-christ), linking
-			// to Parker Hemming's portfolio, bottom right. A faint frame rate,
-			// bottom left.
+			// Maker's mark, carved under the table, and the frame rate
+			// The mark from the footer of hemm.ing is cut into the underside of
+			// the board beneath the pumpkin. Tip the camera down below the table
+			// and look up to find it, by the light of a candle stub somebody left
+			// on the ground. Hover and it's underlined; click it to open Parker
+			// Hemming's portfolio in a new tab.
+			// How it's cut: the lettering is drawn into a height map, deepest along
+			// the middle of each stroke the way a V-chisel leaves it, and that
+			// pushes a finely divided patch of the board up into the wood. The
+			// board's own grain and color carry on through the patch, darker and
+			// rougher down in the cuts and worn paler along their edges, and the
+			// board's underside is opened up where the patch goes, so you're
+			// looking into real grooves.
+			// A faint frame rate, bottom left.
 			// =====================================================================
 
 			const allura = document.createElement("link"); // just the two letters of the "an"
 			allura.rel = "stylesheet";
 			allura.href = "https://fonts.googleapis.com/css2?family=Allura&text=an&display=swap";
+			const alluraLoaded = new Promise((resolve) => (allura.onload = allura.onerror = resolve));
 			document.head.appendChild(allura);
+
+			// The candle stub on the ground under the table.
+			{
+				const stub = new THREE.Group();
+				stub.position.set(-0.75, groundY, -0.3);
+				const wax = glowingWax("#d8c9a8");
+				stub.add(new THREE.Mesh(buildPillar(0.17, 0.32), wax));
+				const wick = new THREE.Vector3(0, 0.3, 0);
+				// The light sits higher than the flame, so its glow reaches the
+				// underside of the table without burning out the ground around it.
+				const light = new THREE.PointLight("#ffa04a", 0, 8, 1.2);
+				light.position.copy(wick).y += 2;
+				stub.add(light);
+				Object.assign(addFlame(stub, wick, 0.075, 0.22, wax), { light, power: 5 });
+				scene.add(shadowed(stub));
+				pickables.push(stub);
+			}
+
+			// The board under the pumpkin, and the patch on its underside: as wide
+			// as the board allows, in the board's own coordinates.
+			table.updateMatrixWorld(true);
+			const markBoard = planks.reduce((best, plank) => (Math.abs(plank.position.z + table.position.z) < Math.abs(best.position.z + table.position.z) ? plank : best));
+			const { length: boardLength, width: boardWidth, thickness: boardThickness, warp: boardWarp } = markBoard.geometry.userData;
+			const MARK_WIDTH = 1.5;
+			const MARK_DEPTH = boardWidth - 0.08;
+			const MARK_CUT = 0.022; // how deep the cuts go (about 3 mm)
+			const markX = markBoard.worldToLocal(new THREE.Vector3(0.1, 0, 0)).x;
+			const MARK_PX = [1200, Math.round((1200 * MARK_DEPTH) / MARK_WIDTH)];
+
+			// The lettering, laid out like the mark on hemm.ing, as white on black.
+			function drawMark(underline) {
+				const [width, height] = MARK_PX;
+				const [canvas, ctx] = makeCanvas(width, height);
+				ctx.fillStyle = "#000";
+				ctx.fillRect(0, 0, width, height);
+				ctx.fillStyle = ctx.strokeStyle = "#fff";
+				ctx.textAlign = "center";
+				ctx.textBaseline = "alphabetic";
+				ctx.lineJoin = "round";
+				// Sized to sit well inside the patch (a board cell clear of its edges),
+				// and cut a little bolder than the type, the way a chisel would.
+				const k = Math.min((height - 140) / 52, (width - 300) / 125);
+				ctx.lineWidth = 0.5 * k;
+				const write = (text, x, y) => {
+					ctx.fillText(text, x, y);
+					ctx.strokeText(text, x, y);
+				};
+				const cx = width / 2;
+				const top = (height - 52 * k) / 2;
+				ctx.save();
+				ctx.translate(cx, 0);
+				ctx.scale(1.15, 1);
+				ctx.font = `200 ${9 * k}px Arial, Helvetica, sans-serif`;
+				["®", "©", "℗", "™"].forEach((symbol, i) => write(symbol, (i - 1.5) * 12 * k, top + 9 * k));
+				ctx.font = `300 ${18 * k}px "Times New Roman", Times, serif`;
+				const hemming = top + 30 * k;
+				write("HEMMING", 0, hemming);
+				const word = ctx.measureText("HEMMING").width;
+				const llc = top + 48 * k;
+				ctx.font = `300 ${18 * k}px "Times New Roman", Times, serif`;
+				const llcWidth = ctx.measureText("LLC").width;
+				ctx.font = `italic 400 ${14 * k}px Allura, cursive`;
+				const anWidth = ctx.measureText("an").width;
+				const lineStart = -(anWidth + 4.5 * k + llcWidth) / 2;
+				ctx.save();
+				ctx.translate(lineStart + anWidth / 2, llc - 1 * k);
+				ctx.rotate((-2.25 * Math.PI) / 180);
+				ctx.scale(1, 1.5);
+				write("an", 0, 0);
+				ctx.restore();
+				ctx.font = `300 ${18 * k}px "Times New Roman", Times, serif`;
+				write("LLC", lineStart + anWidth + 4.5 * k + llcWidth / 2, llc);
+				if (underline) {
+					ctx.fillRect(-word / 2, hemming + 2.8 * k, word, 2.3 * k);
+					ctx.fillRect(lineStart, llc + 2.8 * k, -lineStart * 2, 2.3 * k);
+				}
+				ctx.restore();
+				return ctx.getImageData(0, 0, width, height).data;
+			}
+
+			// Height map, color, normals and roughness for the patch.
+			function carveMark(underline) {
+				const [width, height] = MARK_PX;
+				const ink = drawMark(underline);
+				const count = width * height;
+				// How far each pixel is from the letters' edge (a two-pass chamfer
+				// distance). Inside, it sets how deep the V-cut is; outside, how far
+				// the blood has soaked into the wood.
+				function chamfer(inside) {
+					const distance = new Float32Array(count);
+					for (let i = 0; i < count; i++) distance[i] = ink[i * 4] > 127 === inside ? 1e6 : 0;
+					const relax = (i, j, cost) => j >= 0 && j < count && distance[j] + cost < distance[i] && (distance[i] = distance[j] + cost);
+					for (let y = 0; y < height; y++) {
+						for (let x = 0; x < width; x++) {
+							const i = y * width + x;
+							if (!distance[i]) continue;
+							if (x > 0) relax(i, i - 1, 1);
+							relax(i, i - width, 1);
+							if (x > 0) relax(i, i - width - 1, 1.4);
+							if (x < width - 1) relax(i, i - width + 1, 1.4);
+						}
+					}
+					for (let y = height - 1; y >= 0; y--) {
+						for (let x = width - 1; x >= 0; x--) {
+							const i = y * width + x;
+							if (!distance[i]) continue;
+							if (x < width - 1) relax(i, i + 1, 1);
+							relax(i, i + width, 1);
+							if (x < width - 1) relax(i, i + width + 1, 1.4);
+							if (x > 0) relax(i, i + width - 1, 1.4);
+						}
+					}
+					return distance;
+				}
+				const depth = chamfer(true).map((d) => (d ? Math.min(1, (d - 0.3) / 7) : 0));
+				const outside = chamfer(false);
+
+				// The board's grain, from the same part of its own texture.
+				const board = markBoard.material.map.image;
+				const u0 = (markX - MARK_WIDTH / 2 + boardLength / 2) / boardLength;
+				const v1 = (MARK_DEPTH / 2 + boardWidth / 2) / boardWidth;
+				const [woodCanvas, woodCtx] = makeCanvas(width, height);
+				woodCtx.drawImage(board, u0 * board.width, (1 - v1) * board.height, (MARK_WIDTH / boardLength) * board.width, (MARK_DEPTH / boardWidth) * board.height, 0, 0, width, height);
+				const wood = woodCtx.getImageData(0, 0, width, height);
+
+				const [colorCanvas, colorCtx] = makeCanvas(width, height);
+				const [normalCanvas, normalCtx] = makeCanvas(width, height);
+				const [heightCanvas, heightCtx] = makeCanvas(width, height);
+				const [roughCanvas, roughCtx] = makeCanvas(width, height);
+				const color = colorCtx.createImageData(width, height);
+				const normal = normalCtx.createImageData(width, height);
+				const heights = heightCtx.createImageData(width, height);
+				const rough = roughCtx.createImageData(width, height);
+				const slope = (MARK_CUT * width) / MARK_WIDTH / 2; // depth change per pixel, over 2 pixels
+				for (let y = 0; y < height; y++) {
+					for (let x = 0; x < width; x++) {
+						const i = y * width + x;
+						const o = i * 4;
+						const d = depth[i];
+						const at = (dx, dy) => depth[clamp(y + dy, 0, height - 1) * width + clamp(x + dx, 0, width - 1)];
+						// Blood fills the cut below a sliver of pale wood at the lip: wet and
+						// bright red where it's thin, darker where it pools at the bottom
+						// of the V. Around the letters it has soaked a little way into
+						// the wood, further along the grain than across it.
+						const rim = d ? 0 : Math.max(at(-2, 0), at(2, 0), at(0, -2), at(0, 2)) > 0 ? 1 : 0;
+						const raw = d ? 1.3 - 0.95 * d + 0.12 * woodNoise(x * 0.25, y * 0.25) : 1 + 0.25 * rim;
+						const soak = d ? 0 : clamp(1 - outside[i] / (2 + 34 * woodNoise(x * 0.008 + 40, y * 0.25) ** 3), 0, 1) ** 1.5;
+						if (d > 0.15) {
+							const shade = 1.15 - 0.55 * d + 0.25 * (woodNoise(x * 0.08 + 20, y * 0.08) - 0.5);
+							color.data[o] = 175 * shade;
+							color.data[o + 1] = 14 * shade;
+							color.data[o + 2] = 12 * shade;
+						} else {
+							color.data[o] = THREE.MathUtils.lerp(wood.data[o] * raw + (d ? 14 : 0), 80, 0.75 * soak);
+							color.data[o + 1] = THREE.MathUtils.lerp(wood.data[o + 1] * raw + (d ? 10 : 0), 6, 0.75 * soak);
+							color.data[o + 2] = THREE.MathUtils.lerp(wood.data[o + 2] * raw * (d ? 0.9 : 1), 5, 0.75 * soak);
+						}
+						// Normals point out of the wood; the cut slopes in.
+						const nx = (at(1, 0) - at(-1, 0)) * slope;
+						const ny = -(at(0, 1) - at(0, -1)) * slope;
+						const length = Math.hypot(nx, ny, 1);
+						normal.data[o] = 128 + (127 * nx) / length;
+						normal.data[o + 1] = 128 + (127 * ny) / length;
+						normal.data[o + 2] = 128 + 127 / length;
+						heights.data[o] = heights.data[o + 1] = heights.data[o + 2] = 255 * d;
+						rough.data[o] = rough.data[o + 1] = rough.data[o + 2] = d > 0.15 ? 70 : d ? 255 : 217 - 60 * soak;
+						for (const image of [color, normal, heights, rough]) image.data[o + 3] = 255;
+					}
+				}
+				colorCtx.putImageData(color, 0, 0);
+				normalCtx.putImageData(normal, 0, 0);
+				heightCtx.putImageData(heights, 0, 0);
+				roughCtx.putImageData(rough, 0, 0);
+				return { map: colorTexture(colorCanvas), normalMap: dataTexture(normalCanvas), displacementMap: dataTexture(heightCanvas), roughnessMap: dataTexture(roughCanvas) };
+			}
+
+			// The patch, following the board's warp, a hair below its underside.
+			const markGeometry = new THREE.PlaneGeometry(MARK_WIDTH, MARK_DEPTH, 360, Math.round((360 * MARK_DEPTH) / MARK_WIDTH));
+			{
+				const position = markGeometry.attributes.position;
+				for (let i = 0; i < position.count; i++) {
+					const x = markX + position.getX(i);
+					const z = position.getY(i);
+					position.setXYZ(i, x, -boardThickness / 2 + boardWarp(x, z) - 0.0015, z);
+				}
+				markGeometry.computeVertexNormals();
+			}
+			const markMaterial = new THREE.MeshStandardMaterial({ roughness: 1, displacementScale: -MARK_CUT });
+			const markPatch = new THREE.Mesh(markGeometry, markMaterial);
+			markPatch.visible = false;
+			markPatch.receiveShadow = true;
+			markBoard.add(markPatch);
+
+			// What you hover and click: a plane facing down, so it can't be hit
+			// from above, through the table.
+			const markTarget = new THREE.Mesh(new THREE.PlaneGeometry(MARK_WIDTH, MARK_DEPTH).rotateX(Math.PI / 2), new THREE.MeshBasicMaterial({ visible: false }));
+			markTarget.position.set(markX, -boardThickness / 2 - 0.01, 0);
+			markBoard.add(markTarget);
+
+			let markLooks = null; // [plain, underlined]
+			const showMark = (underline) => markLooks && Object.assign(markMaterial, markLooks[underline ? 1 : 0]);
+			Promise.race([alluraLoaded.then(() => document.fonts.load('400 100px "Allura"', "an")), new Promise((resolve) => setTimeout(resolve, 4000))]).then(() => {
+				markLooks = [carveMark(false)];
+				showMark(false);
+				markMaterial.needsUpdate = true;
+				// Open the board's underside where the patch covers it.
+				const index = markBoard.geometry.index;
+				const position = markBoard.geometry.attributes.position;
+				const { start, count } = markBoard.geometry.groups[3];
+				const inside = (v) => Math.abs(position.getX(v) - markX) < MARK_WIDTH / 2 && Math.abs(position.getZ(v)) < MARK_DEPTH / 2;
+				for (let i = start; i < start + count; i += 3) {
+					const [a, b, c] = [index.getX(i), index.getX(i + 1), index.getX(i + 2)];
+					if (inside(a) && inside(b) && inside(c)) index.setXYZ(i, a, a, a);
+				}
+				index.needsUpdate = true;
+				markPatch.visible = true;
+				setTimeout(() => markLooks.push(carveMark(true)), 500);
+				// Shrink what you hover to the lettering itself, underlines included.
+				const [width, height] = MARK_PX;
+				const ink = drawMark(true);
+				let [left, right, top, bottom] = [width, 0, height, 0];
+				for (let y = 0; y < height; y++) {
+					for (let x = 0; x < width; x++) {
+						if (ink[(y * width + x) * 4] < 128) continue;
+						[left, right, top, bottom] = [Math.min(left, x), Math.max(right, x), Math.min(top, y), Math.max(bottom, y)];
+					}
+				}
+				markTarget.scale.set((right - left + 24) / width, 1, (bottom - top + 24) / height);
+				markTarget.position.x = markX + ((left + right) / 2 / width - 0.5) * MARK_WIDTH;
+				markTarget.position.z = (0.5 - (top + bottom) / 2 / height) * MARK_DEPTH;
+			});
+
+			interactives.push({ object: markTarget, onClick: () => open("https://hemm.ing", "_blank", "noopener") });
+			pickables.push(markTarget);
+			let markHovered = false;
+			addEventListener("pointermove", (event) => {
+				if (event.pointerType === "touch" || press) return;
+				pointerNDC.set((event.clientX / innerWidth) * 2 - 1, -(event.clientY / innerHeight) * 2 + 1);
+				raycaster.setFromCamera(pointerNDC, camera);
+				const over = raycaster.intersectObject(markTarget).length > 0;
+				if (over === markHovered) return;
+				markHovered = over;
+				showMark(over);
+				renderer.domElement.style.cursor = over ? "pointer" : "";
+			});
 
 			const cornerStyles = document.createElement("style");
 			cornerStyles.textContent = `
-				.maker-mark {
-					position: fixed;
-					right: max(18px, env(safe-area-inset-right));
-					bottom: max(12px, env(safe-area-inset-bottom));
-					display: inline-block;
-					text-decoration: none;
-					opacity: 0.4;
-					transition: opacity 0.2s;
-				}
-				.maker-mark:hover,
-				.maker-mark:focus-visible {
-					opacity: 0.8;
-				}
-				/* The symbols sit in its top padding, inside its box. */
-				.maker-mark__text {
-					position: relative;
-					display: block;
-					padding-top: 14px;
-					color: #f6f6f6;
-					font: 300 18px/1 "Times New Roman", serif;
-					letter-spacing: 0.1px;
-					text-align: center;
-					opacity: 0.6;
-					transform: scaleX(1.15) scaleY(0.9);
-				}
-				.maker-mark__symbols {
-					position: absolute;
-					top: 0;
-					left: 50%;
-					display: flex;
-					gap: 4px;
-					align-items: center;
-					justify-content: center;
-					font: 200 9px/9px Arial, Helvetica, sans-serif;
-					opacity: 0.5;
-					transform: translateX(-50%) scaleY(1.1);
-				}
-				.maker-mark__an {
-					display: inline-block;
-					font: italic 400 14px "Allura", cursive;
-					transform: scaleX(1) scaleY(1.5) translateY(-1px) rotate(-2.25deg);
-				}
 				.frame-rate {
 					position: fixed;
 					left: max(16px, env(safe-area-inset-left));
-					bottom: max(14px, env(safe-area-inset-bottom));
+					top: max(14px, env(safe-area-inset-top));
 					color: #e8d8bf;
 					font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
 					letter-spacing: 0.5px;
@@ -5878,20 +7495,6 @@
 				}
 			`;
 			document.head.appendChild(cornerStyles);
-
-			const mark = document.createElement("a");
-			mark.className = "maker-mark";
-			mark.href = "https://hemm.ing";
-			mark.target = "_blank";
-			mark.rel = "noopener";
-			mark.setAttribute("aria-label", "Hemming, an LLC: Parker Hemming's portfolio");
-			mark.innerHTML = `
-				<span class="maker-mark__text">
-					<span class="maker-mark__symbols" aria-hidden="true"><span>®</span><span>©</span><span>℗</span><span>™</span></span>
-					HEMMING<br /><span class="maker-mark__an">an</span> LLC
-				</span>
-			`;
-			document.body.appendChild(mark);
 
 			const frameRate = document.createElement("div");
 			frameRate.className = "frame-rate";
@@ -5961,8 +7564,12 @@
 				stepPhysics(dt);
 				updateProps(dt, t);
 				updateSurroundings(dt, t);
+				updateRat(dt, t);
+				releaseGround();
 				updateSweep(dt);
+				limitZoom();
 				controls.update();
+				holdAboveGround();
 
 				// Cutaway follows the camera; wireframes only draw when it's close.
 				cutaway.center.value.copy(camera.position);
@@ -5995,11 +7602,17 @@
 				// On tall screens, widen the vertical view so the pumpkin still fits.
 				camera.fov = aspect < 1 ? Math.min(75, THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(19)) / aspect))) : 38;
 				camera.updateProjectionMatrix();
+				// Each rendered pixel takes over 100 bytes of GPU memory across the
+				// multisampled buffers, so big high-density windows stop at about
+				// four million pixels. Running out loses the WebGL context.
+				renderer.setPixelRatio(Math.min(quality.level === 2 ? devicePixelRatio : 1, 2, Math.sqrt(4e6 / (width * height))));
 				renderer.setSize(width, height, false);
 				composer.setPixelRatio(renderer.getPixelRatio());
 				composer.setSize(width, height);
 				grade.uniforms.uResolution.value.set(width * renderer.getPixelRatio(), height * renderer.getPixelRatio());
 				grade.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+				starMaterial.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+				placePiano();
 				// Smoke particles size themselves in world units.
 				pointScale.value = (height * renderer.getPixelRatio()) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
 			}
