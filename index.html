@@ -145,10 +145,47 @@
 
 			Object.assign(document.body.style, { margin: "0", overflow: "hidden", backgroundColor: "black" });
 
+			// When the browser's 3D graphics won't start, or are lost partway
+			// through, say so rather than leave a black page. (Safari can refuse
+			// WebGL to a page for a while after its graphics have crashed, until
+			// it's quit and reopened.)
+			function showTrouble(text, detail = "") {
+				const note = document.createElement("p");
+				note.textContent = text;
+				Object.assign(note.style, { position: "fixed", inset: "0", margin: "0", display: "grid", placeContent: "center", gap: "10px", padding: "24px", color: "#e8d8bf", font: "15px/1.5 system-ui, sans-serif", textAlign: "center", zIndex: "10" });
+				if (detail) {
+					const small = document.createElement("small");
+					small.textContent = detail; // what went wrong, for whoever's fixing it
+					Object.assign(small.style, { opacity: "0.5", font: "12px/1.4 ui-monospace, monospace" });
+					note.appendChild(small);
+				}
+				document.body.appendChild(note);
+				return note;
+			}
+
 			// No antialias on the canvas itself: the scene renders into the
 			// composer's multisampled buffer, so a multisampled canvas would only
 			// take up GPU memory.
-			const renderer = new THREE.WebGLRenderer();
+			const renderer = (() => {
+				try {
+					return new THREE.WebGLRenderer();
+				} catch (error) {
+					// Which kinds of WebGL a fresh canvas gets right now, and whether
+					// they arrive already lost.
+					const offers = ["webgl2", "webgl"].map((type) => {
+						const gl = document.createElement("canvas").getContext(type);
+						return `${type} ${!gl ? "unavailable" : gl.isContextLost() ? "lost" : "ok"}`;
+					});
+					showTrouble("The 3D scene couldn't start because this browser's graphics (WebGL) aren't available right now. Reload, or quit and reopen the browser, and try again.", `${error.message} (${offers.join(", ")})`);
+					throw error;
+				}
+			})();
+			let lostNote = null;
+			renderer.domElement.addEventListener("webglcontextlost", () => (lostNote ??= showTrouble("The browser's graphics were reset. Reload the page to bring the scene back.")));
+			renderer.domElement.addEventListener("webglcontextrestored", () => {
+				lostNote?.remove();
+				lostNote = null;
+			});
 			renderer.shadowMap.enabled = true;
 			renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 			renderer.toneMapping = THREE.NeutralToneMapping;
@@ -3339,14 +3376,6 @@
 						scene.attach(item);
 						this.body = addDynamic(item, [collider()], { density: 0.6, friction: 0.8 });
 					},
-					// When you start to drag it, it pops straight up out of the drawer:
-					// above the tabletop if it's out in front, or just over the drawer's
-					// sides if it's still underneath.
-					pop() {
-						delete this.pop;
-						const t = this.body.translation();
-						this.body.setTranslation({ x: t.x, y: t.z - 0.3 > tableFront ? 0.2 : -0.16, z: t.z }, true);
-					},
 				});
 			{
 				const { width, height, depth } = DRAWER;
@@ -3405,6 +3434,30 @@
 			}
 			drawer.position.set(DRAWER.x, -0.3, legZ - 0.02);
 			table.add(shadowed(drawer));
+
+			// Anything in the drawer, whether it started there or was dropped in,
+			// rises straight up out of it the moment you press on it, quickly then
+			// easing, to just above the tabletop so it can go straight onto the
+			// table, and hangs there until you let go or drag it. Says whether it
+			// did.
+			let popping = null; // { body, y }: something rising out of the drawer to height y
+			function popOutOfDrawer(body, object) {
+				const t = body.translation();
+				const front = drawerHome.z + 1.05 * drawerState.amount;
+				const inside = Math.abs(t.x - drawerHome.x) < DRAWER.width / 2 && t.z < front && t.z > front - DRAWER.depth && Math.abs(t.y - drawerHome.y) < DRAWER.height / 2 + 0.05;
+				if (!inside) return false;
+				const box = new THREE.Box3().setFromObject(object);
+				popping = { body, y: t.y + Math.max(0, 0.15 - box.min.y) };
+				body.setGravityScale(0, true);
+				body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+				return true;
+			}
+			function updatePop() {
+				if (!popping) return;
+				if (!press || press.dragging) return (popping = null); // let go, or dragging takes over
+				popping.body.setLinvel({ x: 0, y: clamp((popping.y - popping.body.translation().y) * 12, -3, 3), z: 0 }, true);
+				popping.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+			}
 
 			// Drag it by its front: it follows the pointer along its runners,
 			// rasping as it goes and knocking when it hits either end.
@@ -3487,6 +3540,7 @@
 					if (!hit) return;
 					hit.entry.lift?.();
 					press = { ...hit, x: event.clientX, y: event.clientY, dragging: false };
+					if (hit.entry.body) press.popped = popOutOfDrawer(hit.entry.body, hit.entry.object);
 					if (!hit.entry.body && !hit.entry.grab) return; // click-only: leave the camera free to drag
 					controls.enabled = false; // the controls' own listener runs after this one
 					dragTarget.copy(hit.point);
@@ -3502,10 +3556,10 @@
 				"pointerdown",
 				(event) => {
 					if (!press || event.isPrimary) return;
-					const { entry, dragging } = press;
+					const { entry, dragging, popped } = press;
 					press = null;
 					if (!entry.body && !entry.grab) return; // click-only: the controls already have the first finger
-					if (dragging) entry.body?.setGravityScale(1, true);
+					if (dragging || popped) entry.body?.setGravityScale(1, true);
 					renderer.domElement.style.cursor = "";
 					controls.enabled = true;
 					handingOver = true;
@@ -3539,7 +3593,6 @@
 					if (press.dragging && press.entry.pull) return press.entry.pull(event.clientX - press.x, event.clientY - press.y);
 					if (!press.dragging && press.entry.body && Math.hypot(event.clientX - press.x, event.clientY - press.y) > 6) {
 						const body = press.entry.body;
-						press.entry.pop?.();
 						body.wakeUp();
 						body.setGravityScale(0, true);
 						camera.getWorldDirection(_v);
@@ -3560,12 +3613,9 @@
 
 			function release(event) {
 				if (!press || !event.isPrimary) return;
-				if (press.dragging) {
-					press.entry.body?.setGravityScale(1, true);
-					renderer.domElement.style.cursor = "";
-				} else if (Math.hypot(event.clientX - press.x, event.clientY - press.y) <= 6) {
-					press.entry.onClick?.();
-				}
+				if (press.dragging || press.popped) press.entry.body?.setGravityScale(1, true);
+				if (press.dragging) renderer.domElement.style.cursor = "";
+				else if (Math.hypot(event.clientX - press.x, event.clientY - press.y) <= 6) press.entry.onClick?.();
 				press = null;
 				controls.enabled = true;
 				sweep.idle = 0;
@@ -3589,6 +3639,7 @@
 				physicsTime += dt;
 				while (physicsTime >= PHYSICS_STEP) {
 					updateDrag();
+					updatePop();
 					world.step();
 					physicsTime -= PHYSICS_STEP;
 				}
@@ -4317,11 +4368,11 @@
 			// stands further back on narrow screens, so it takes up about the
 			// same share of any screen.
 			function placePiano() {
-				const toCamera = new THREE.Spherical().setFromVector3(cameraHome.clone().sub(controls.target));
+				const toCamera = new THREE.Spherical().setFromVector3(cameraHome.clone().sub(orbitHome));
 				toCamera.theta = turn + SWING;
-				const eye = controls.target.clone().add(new THREE.Vector3().setFromSpherical(toCamera));
+				const eye = orbitHome.clone().add(new THREE.Vector3().setFromSpherical(toCamera));
 				const halfWidth = Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.aspect);
-				const edge = controls.target.clone().sub(eye).setY(0).normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), halfWidth + 0.02);
+				const edge = orbitHome.clone().sub(eye).setY(0).normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), halfWidth + 0.02);
 				piano.position.copy(eye).addScaledVector(edge, clamp(12 / Math.tan(halfWidth), 17, 26)).setY(groundY);
 				piano.rotation.y = Math.atan2(eye.x - piano.position.x, eye.z - piano.position.z) - 0.3;
 				piano.userData.soundAt.copy(piano.position).y += 4.5;
@@ -5229,6 +5280,7 @@
 			// starts the same height above it as it used to sit above the middle.
 			pumpkin.updateMatrixWorld(true);
 			flame.getWorldPosition(controls.target).y += 0.05;
+			const orbitHome = controls.target.clone();
 			camera.position.set(Math.sin(turn) * 5 + 0.3, controls.target.y + 0.85, Math.cos(turn) * 5);
 			const cameraHome = camera.position.clone();
 
@@ -5238,19 +5290,54 @@
 			// out first. Either way you never pass through the table.
 			controls.minPolarAngle = 0.12 * Math.PI;
 			controls.maxPolarAngle = 0.9 * Math.PI; // the same at any zoom
-			// Under the table, you can't zoom in up through it.
-			function limitZoom() {
-				const offset = camera.position.clone().sub(controls.target);
-				const below = controls.target.y + 0.55; // from the flame down to just under the table
-				controls.minDistance = camera.position.y < -0.5 ? below / Math.max(0.3, -offset.y / offset.length()) : 0.25;
+			// Under the table, zooming in also brings the carved mark to the middle
+			// of the view, a little with every step, so it's centered just as you
+			// reach the closest zoom: the camera keeps looking the same way and
+			// goes in a straight line from wherever you start to just under the
+			// mark, so it drifts sideways evenly the whole way in. Zooming out
+			// undoes it the same way, back to the flame by the starting distance,
+			// and zooming above the table heads back to the flame too. Nothing moves it unless
+			// you zoom, and zooming never takes it into the table. (The controls
+			// zoom as soon as you scroll or pinch; this sees how far since last
+			// frame.)
+			const _mark = new THREE.Vector3();
+			const _shift = new THREE.Vector3();
+			const CLOSEST = 0.35; // where the mark is centered
+			const FARTHEST = 5; // where it's back to the flame
+			const settled = { reach: 0, position: new THREE.Vector3(), target: new THREE.Vector3() }; // where the camera was at the end of last frame
+			// Over the table, and inside the tabletop (or just under it).
+			const overTable = (p) => Math.abs(p.x - table.position.x) < 2.15 && p.z > tableBack - 0.1 && p.z < tableFront + 0.1;
+			const inTable = (p) => overTable(p) && p.y > -0.2 && p.y < 0.02;
+			const throughTable = (a, b) => (overTable(a) || overTable(b)) && a.y < -0.1 !== b.y < -0.1;
+			function zoomTowardMark() {
+				const target = controls.target;
+				const [before, after] = [settled.reach, camera.position.distanceTo(target)];
+				if (before && Math.abs(after / before - 1) > 1e-4) {
+					const zoomingIn = after < before;
+					const aim = camera.position.y < -0.2 && zoomingIn ? markTarget.getWorldPosition(_mark) : orbitHome;
+					// How much of the rest of the way this step covers.
+					const share = zoomingIn ? (before - after) / (before - CLOSEST) : (after - before) / (FARTHEST - before);
+					_shift.subVectors(aim, target).multiplyScalar(share > 0 && share < 1 ? share : 1);
+					target.add(_shift);
+					camera.position.add(_shift);
+					// Never zoom into the table: a step that would go in doesn't happen.
+					if ((inTable(camera.position) && !inTable(settled.position)) || throughTable(settled.position, camera.position)) {
+						camera.position.copy(settled.position);
+						target.copy(settled.target);
+					}
+				}
+				settled.reach = camera.position.distanceTo(target);
+				settled.position.copy(camera.position);
+				settled.target.copy(target);
 			}
 
 			// Turning down past the ground slides the camera in toward the flame,
 			// along its line of sight, instead of into the ground, and back out to
 			// where it was as you turn up again.
 			let groundHeld = 0; // how far out the camera wants to be while the ground holds it in
+			let groundPulled = 0; // and how far out it was held, so zooming meanwhile still counts
 			function releaseGround() {
-				if (groundHeld) camera.position.sub(controls.target).setLength(groundHeld).add(controls.target);
+				if (groundHeld) camera.position.sub(controls.target).multiplyScalar(groundHeld / groundPulled).add(controls.target);
 				groundHeld = 0;
 			}
 			function holdAboveGround() {
@@ -5259,6 +5346,7 @@
 				const offset = camera.position.clone().sub(controls.target);
 				groundHeld = offset.length();
 				camera.position.copy(controls.target).addScaledVector(offset, (controls.target.y - floor) / -offset.y);
+				groundPulled = camera.position.distanceTo(controls.target);
 			}
 
 			const sweep = { idle: 0, velocity: 0, direction: 1, dragging: false };
@@ -7211,15 +7299,16 @@
 				for (const type of ["pointerdown", "wheel", "keydown"]) removeEventListener(type, dismissGuide, { capture: true });
 			}
 			for (const type of ["pointerdown", "wheel", "keydown"]) addEventListener(type, dismissGuide, { capture: true });
-			setTimeout(dismissGuide, 9000);
 
 			// =====================================================================
-			// Maker's mark, carved under the table, and the frame rate
+			// Maker's mark, carved under the table and in the corner, and the
+			// frame rate
 			// The mark from the footer of hemm.ing is cut into the underside of
 			// the board beneath the pumpkin. Tip the camera down below the table
 			// and look up to find it, by the light of a candle stub somebody left
 			// on the ground. Hover and it's underlined; click it to open Parker
-			// Hemming's portfolio in a new tab.
+			// Hemming's portfolio in a new tab. It's also in the bottom right,
+			// faintly, as a plain link.
 			// How it's cut: the lettering is drawn into a height map, deepest along
 			// the middle of each stroke the way a V-chisel leaves it, and that
 			// pushes a finely divided patch of the board up into the wood. The
@@ -7428,6 +7517,233 @@
 			markPatch.receiveShadow = true;
 			markBoard.add(markPatch);
 
+			// A bloody handprint off to the right of the lettering, on the board in
+			// front of it, at an angle with its runs spilling back across the gap,
+			// as if somebody with a hand soaked in blood slapped it up there: the fingers printed in broken patches, the palm heavy
+			// and uneven, and blood streaming off it in runs one way, some short,
+			// a few long ones ending in a drop, with paler, watery trails behind
+			// them. Drops still hang from the wood at the ends of the longest runs.
+			// It's laid out on a patch of the table's underside, in the table's
+			// own coordinates, and each board gets its own piece of it.
+			const handBoards = planks;
+			const HAND_SIZE = [1.2, 1.0]; // the patch, along and across the boards
+			const HAND_CENTER = [1.08 - table.position.x, 0.24 - table.position.z];
+			const HAND_PX = [Math.round((640 * HAND_SIZE[0]) / HAND_SIZE[1]), 640];
+			const HAND_TURN = -0.75; // fingers toward the left end and the front, runs the other way
+			const HAND_SCALE = (0.56 / 380) * (HAND_PX[1] / HAND_SIZE[1]); // a hand 0.56 long; the drawing's is 380
+			// From the drawing's own coordinates (fingers up, the palm around
+			// 256, 340, runs going down) to the canvas, and to the table. It's
+			// mirrored, so from below it reads as a right hand.
+			function handToCanvas(ctx) {
+				ctx.translate(HAND_PX[0] / 2, HAND_PX[1] / 2);
+				ctx.rotate(HAND_TURN);
+				ctx.scale(-HAND_SCALE, HAND_SCALE);
+				ctx.translate(-256, -350);
+			}
+			function handOnTable(x, y) {
+				const [dx, dy] = [-(x - 256) * HAND_SCALE, (y - 350) * HAND_SCALE];
+				const px = HAND_PX[0] / 2 + dx * Math.cos(HAND_TURN) - dy * Math.sin(HAND_TURN);
+				const py = HAND_PX[1] / 2 + dx * Math.sin(HAND_TURN) + dy * Math.cos(HAND_TURN);
+				return [HAND_CENTER[0] + (px / HAND_PX[0] - 0.5) * HAND_SIZE[0], HAND_CENTER[1] + (0.5 - py / HAND_PX[1]) * HAND_SIZE[1]];
+			}
+			// A point on the table's underside, as [board, its own coordinates],
+			// or nothing if it's over a gap or off the end.
+			function underBoard(x, z) {
+				for (const board of handBoards) {
+					const { length, width, thickness, warp } = board.geometry.userData;
+					board.updateMatrix();
+					const local = new THREE.Vector3(x, 0, z).applyMatrix4(board.matrix.clone().invert());
+					if (Math.abs(local.x) > length / 2 - 0.01 || Math.abs(local.z) > width / 2 - 0.004) continue;
+					return [board, local.setY(-thickness / 2 + warp(local.x, local.z) - 0.0015)];
+				}
+				return null;
+			}
+
+			const handDrips = []; // where the longest runs end, in the drawing's coordinates
+			function bloodyHand() {
+				const [canvas, ctx] = makeCanvas(...HAND_PX);
+				handToCanvas(ctx);
+				rand = mulberry32(6660);
+				const red = (alpha) => `rgba(${randInt(100, 132)}, ${randInt(5, 13)}, ${randInt(4, 10)}, ${alpha})`;
+				const blob = (x, y, rx, ry, a = 0) => {
+					ctx.beginPath();
+					ctx.ellipse(x, y, rx, ry, a, 0, TAU);
+					ctx.fill();
+				};
+				// A run straight down from (x, y): wavering a little, thinning, and
+				// ending in a bead. Returns where it ends.
+				const run = (x, y, length, width) => {
+					const left = [];
+					const right = [];
+					for (let t = 0, wx = x; t <= length; t += 12) {
+						wx += random(-1.2, 1.2);
+						const w = width * (1 - 0.45 * (t / length)) * random(0.85, 1.15);
+						left.push([wx - w / 2, y + t]);
+						right.unshift([wx + w / 2, y + t]);
+					}
+					ctx.beginPath();
+					for (const [px, py] of [...left, ...right]) ctx.lineTo(px, py);
+					ctx.fill();
+					const [ex, ey] = left[left.length - 1];
+					blob(ex + width * 0.28, ey + width * 0.3, width * 0.5, width * 0.62);
+					return [ex + width * 0.28, ey + width * 0.6];
+				};
+				const fingers = [
+					[192, 285, 170, 210, 152, 150, 30], // little finger
+					[230, 262, 222, 170, 214, 92, 35],
+					[272, 255, 278, 160, 282, 72, 37],
+					[314, 265, 332, 180, 346, 106, 35],
+					[318, 370, 380, 340, 428, 288, 40], // thumb
+				];
+				const along = ([x0, y0, cx, cy, x1, y1], t) => [(1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t * t * x1, (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t * t * y1];
+				// Where runs start: under the heel and along the bottom of the palm,
+				// and from the fingers and thumb.
+				const starts = [];
+				for (let x = 186; x <= 334; x += random(7, 16)) starts.push([x, 412 + 30 * Math.sin(((x - 186) / 148) * Math.PI) + random(-6, 6)]);
+				for (const finger of fingers) for (const t of [0.15, 0.5, 0.85]) if (rand() < 0.6) starts.push(along(finger, t));
+
+				// Pale, watery trails first, behind everything.
+				for (const [x, y] of starts) {
+					if (rand() < 0.4) continue;
+					ctx.fillStyle = `rgba(150, 25, 22, ${random(0.08, 0.16)})`;
+					run(x + random(-6, 6), y, random(60, 300), random(14, 30));
+				}
+				// The print itself: the palm, and the fingers in broken patches.
+				ctx.fillStyle = red(0.95);
+				ctx.beginPath();
+				ctx.moveTo(190, 278);
+				ctx.quadraticCurveTo(170, 350, 196, 418);
+				ctx.quadraticCurveTo(222, 452, 262, 446);
+				ctx.quadraticCurveTo(312, 444, 330, 410);
+				ctx.quadraticCurveTo(352, 372, 334, 330);
+				ctx.quadraticCurveTo(334, 290, 318, 262);
+				ctx.quadraticCurveTo(296, 246, 272, 252);
+				ctx.quadraticCurveTo(250, 246, 230, 258);
+				ctx.quadraticCurveTo(205, 260, 190, 278);
+				ctx.fill();
+				for (let i = 0; i < 70; i++) {
+					// a ragged edge
+					const a = random(0, TAU);
+					ctx.fillStyle = red(random(0.7, 0.95));
+					blob(258 + Math.cos(a) * random(70, 92), 350 + Math.sin(a) * random(80, 98), random(4, 12), random(4, 12));
+				}
+				for (const finger of fingers) {
+					const w = finger[6];
+					for (const [t0, t1] of [
+						[0, 0.3],
+						[0.4, 0.68],
+						[0.76, 1],
+					]) {
+						if (t0 === 0.4 && rand() < 0.3) continue; // a joint that didn't print
+						ctx.fillStyle = red(random(0.8, 0.97));
+						for (let t = t0; t <= t1; t += 0.04) {
+							const [x, y] = along(finger, t);
+							blob(x + random(-2, 2), y + random(-2, 2), w * random(0.38, 0.5), w * random(0.38, 0.5));
+						}
+					}
+					const [x, y] = along(finger, 1);
+					ctx.fillStyle = red(0.95);
+					blob(x, y, w * 0.55, w * 0.62); // the pad, pressed widest
+				}
+				// The runs.
+				const ends = [];
+				for (const [x, y] of starts) {
+					ctx.fillStyle = red(random(0.85, 0.97));
+					const long = rand() < 0.3;
+					ends.push([run(x, y - 4, long ? random(140, 270) : random(20, 100), random(4, 11)), long]);
+				}
+				handDrips.push(...ends.filter(([[, y], long]) => long && y > 480).map(([end]) => end).slice(0, 6)); // only past the heel
+				// A few drops flung off as it hit.
+				for (let i = 0; i < 18; i++) {
+					const a = random(0, TAU);
+					const d = random(180, 260);
+					ctx.fillStyle = red(random(0.8, 0.95));
+					const r = random(2, 7);
+					blob(256 + Math.cos(a) * d, 300 + Math.sin(a) * d * 0.8, r * random(1, 2.5), r, a);
+				}
+				// Gaps where the skin didn't touch: the lines of the palm, its hollow,
+				// and specks.
+				ctx.globalCompositeOperation = "destination-out";
+				ctx.strokeStyle = "rgba(0, 0, 0, 0.6)";
+				ctx.lineWidth = 3;
+				for (const [x0, y0, cx, cy, x1, y1] of [
+					[180, 300, 250, 280, 330, 300], // heart line
+					[185, 335, 250, 320, 305, 345], // head line
+					[300, 275, 250, 340, 290, 430], // life line
+				]) {
+					ctx.beginPath();
+					ctx.moveTo(x0, y0);
+					ctx.quadraticCurveTo(cx, cy, x1, y1);
+					ctx.stroke();
+				}
+				const hollow = ctx.createRadialGradient(250, 335, 0, 250, 335, 60);
+				hollow.addColorStop(0, "rgba(0, 0, 0, 0.5)");
+				hollow.addColorStop(1, "rgba(0, 0, 0, 0)");
+				ctx.fillStyle = hollow;
+				ctx.fillRect(150, 230, 200, 210);
+				for (let i = 0; i < 500; i++) {
+					ctx.fillStyle = `rgba(0, 0, 0, ${random(0.2, 0.6)})`;
+					blob(random(130, 450), random(50, 450), random(1, 3.5), random(1, 3.5));
+				}
+				// Darker where it pooled thickest, and a wet sheen down some runs.
+				ctx.globalCompositeOperation = "source-atop";
+				for (let i = 0; i < 45; i++) {
+					ctx.fillStyle = `rgba(40, 2, 2, ${random(0.15, 0.45)})`;
+					blob(random(150, 440), random(70, 520), random(5, 20), random(4, 14), random(0, TAU));
+				}
+				ctx.fillStyle = "rgba(190, 40, 34, 0.2)";
+				for (const [[x, y]] of ends.slice(0, 12)) blob(x - 2, y - 40, 1.5, 30);
+				return colorTexture(canvas);
+			}
+			// Each board's piece: the part of the patch under that board, following
+			// its own surface.
+			const handMaterial = new THREE.MeshStandardMaterial({ map: bloodyHand(), transparent: true, roughness: 0.55, depthWrite: false });
+			const handPrints = handBoards.flatMap((board) => {
+				const { length, width } = board.geometry.userData;
+				const [bx, , bz] = plankBoxes[planks.indexOf(board)][0].toArray();
+				const x0 = Math.max(HAND_CENTER[0] - HAND_SIZE[0] / 2, bx - length / 2 + 0.01);
+				const x1 = Math.min(HAND_CENTER[0] + HAND_SIZE[0] / 2, bx + length / 2 - 0.01);
+				const z0 = Math.max(HAND_CENTER[1] - HAND_SIZE[1] / 2, bz - width / 2 + 0.005);
+				const z1 = Math.min(HAND_CENTER[1] + HAND_SIZE[1] / 2, bz + width / 2 - 0.005);
+				if (x0 >= x1 || z0 >= z1) return []; // nowhere near this board
+				const geometry = new THREE.PlaneGeometry(1, 1, 48, 24);
+				const position = geometry.attributes.position;
+				const uv = geometry.attributes.uv;
+				for (let i = 0; i < position.count; i++) {
+					const x = x0 + (position.getX(i) + 0.5) * (x1 - x0);
+					const z = z0 + (position.getY(i) + 0.5) * (z1 - z0);
+					uv.setXY(i, (x - HAND_CENTER[0]) / HAND_SIZE[0] + 0.5, (z - HAND_CENTER[1]) / HAND_SIZE[1] + 0.5);
+					const { length: bl, width: bw, thickness, warp } = board.geometry.userData;
+					const local = new THREE.Vector3(x, 0, z).applyMatrix4(board.matrix.clone().invert());
+					position.setXYZ(i, local.x, -thickness / 2 + warp(clamp(local.x, -bl / 2, bl / 2), clamp(local.z, -bw / 2, bw / 2)) - 0.0015, local.z);
+				}
+				geometry.computeVertexNormals();
+				const print = new THREE.Mesh(geometry, handMaterial);
+				print.receiveShadow = true;
+				board.add(print);
+				return [print];
+			});
+
+			// Drops hanging at the ends of the longest runs: a film where it
+			// clings to the wood, narrowing, then a round bead.
+			const dropMaterial = new THREE.MeshStandardMaterial({ color: "#4a0403", roughness: 0.12 });
+			for (const [x, y] of handDrips) {
+				const length = random(0.025, 0.07);
+				const bead = random(0.006, 0.011);
+				const profile = [];
+				for (let k = 0; k <= 16; k++) {
+					const fromTip = length * (k / 16) ** 1.5;
+					const film = bead * (0.45 + 0.9 * smoothstep(length * 0.55, length, fromTip));
+					const swell = bead * Math.sqrt(Math.max(0, 1 - ((fromTip - bead) / bead) ** 2));
+					profile.push([fromTip < bead ? swell : Math.max(film, swell), fromTip - length]);
+				}
+				const under = underBoard(...handOnTable(x, y));
+				if (!under) continue; // it ended over the gap
+				const drop = new THREE.Mesh(lathe(profile, 10), dropMaterial);
+				drop.position.copy(under[1]).y -= 0.001;
+				under[0].add(drop);
+			}
+
 			// What you hover and click: a plane facing down, so it can't be hit
 			// from above, through the table.
 			const markTarget = new THREE.Mesh(new THREE.PlaneGeometry(MARK_WIDTH, MARK_DEPTH).rotateX(Math.PI / 2), new THREE.MeshBasicMaterial({ visible: false }));
@@ -7483,10 +7799,52 @@
 
 			const cornerStyles = document.createElement("style");
 			cornerStyles.textContent = `
+				.maker-mark {
+					position: fixed;
+					right: max(18px, env(safe-area-inset-right));
+					bottom: max(12px, env(safe-area-inset-bottom));
+					display: inline-block;
+					text-decoration: none;
+					opacity: 0.25;
+					transition: opacity 0.2s;
+				}
+				.maker-mark:hover,
+				.maker-mark:focus-visible {
+					opacity: 0.7;
+				}
+				/* The symbols sit in its top padding, inside its box. */
+				.maker-mark__text {
+					position: relative;
+					display: block;
+					padding-top: 14px;
+					color: #f6f6f6;
+					font: 300 18px/1 "Times New Roman", serif;
+					letter-spacing: 0.1px;
+					text-align: center;
+					opacity: 0.6;
+					transform: scaleX(1.15) scaleY(0.9);
+				}
+				.maker-mark__symbols {
+					position: absolute;
+					top: 0;
+					left: 50%;
+					display: flex;
+					gap: 4px;
+					align-items: center;
+					justify-content: center;
+					font: 200 9px/9px Arial, Helvetica, sans-serif;
+					opacity: 0.5;
+					transform: translateX(-50%) scaleY(1.1);
+				}
+				.maker-mark__an {
+					display: inline-block;
+					font: italic 400 14px "Allura", cursive;
+					transform: scaleX(1) scaleY(1.5) translateY(-1px) rotate(-2.25deg);
+				}
 				.frame-rate {
 					position: fixed;
 					left: max(16px, env(safe-area-inset-left));
-					top: max(14px, env(safe-area-inset-top));
+					bottom: max(14px, env(safe-area-inset-bottom));
 					color: #e8d8bf;
 					font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
 					letter-spacing: 0.5px;
@@ -7495,6 +7853,21 @@
 				}
 			`;
 			document.head.appendChild(cornerStyles);
+
+			// The mark from the footer of hemm.ing again, faintly, bottom right.
+			const mark = document.createElement("a");
+			mark.className = "maker-mark";
+			mark.href = "https://hemm.ing";
+			mark.target = "_blank";
+			mark.rel = "noopener";
+			mark.setAttribute("aria-label", "Hemming, an LLC: Parker Hemming's portfolio");
+			mark.innerHTML = `
+				<span class="maker-mark__text">
+					<span class="maker-mark__symbols" aria-hidden="true"><span>®</span><span>©</span><span>℗</span><span>™</span></span>
+					HEMMING<br /><span class="maker-mark__an">an</span> LLC
+				</span>
+			`;
+			document.body.appendChild(mark);
 
 			const frameRate = document.createElement("div");
 			frameRate.className = "frame-rate";
@@ -7567,8 +7940,8 @@
 				updateRat(dt, t);
 				releaseGround();
 				updateSweep(dt);
-				limitZoom();
 				controls.update();
+				zoomTowardMark();
 				holdAboveGround();
 
 				// Cutaway follows the camera; wireframes only draw when it's close.
@@ -7619,7 +7992,19 @@
 
 			addEventListener("resize", resize);
 			resize();
-			renderer.setAnimationLoop(animate);
+			// Compile every shader before the first frame, in the background, so the
+			// page doesn't freeze while it happens: Safari can take many seconds
+			// the first time, and doing it all inside one frame can make it give up
+			// on WebGL entirely. It's compiled for the buffer the scene really
+			// renders into (not the screen), or it would all be done again. The
+			// guide shows meanwhile, and its timer starts with the first frame.
+			renderer.setRenderTarget(composer.readBuffer);
+			const compiled = renderer.compileAsync(scene, camera);
+			renderer.setRenderTarget(null);
+			compiled.then(() => {
+				renderer.setAnimationLoop(animate);
+				setTimeout(dismissGuide, 9000);
+			});
 		</script>
 	</body>
 </html>
