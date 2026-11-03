@@ -1904,18 +1904,41 @@
 				return object;
 			}
 
+			// Parts that never move against each other, as one mesh per material
+			// they share: one draw instead of many, in every pass including each
+			// shadow, and they look exactly the same. They must be plain meshes
+			// directly in the group.
+			function mergeParts(group, meshes) {
+				const byMaterial = new Map();
+				for (const mesh of meshes) byMaterial.set(mesh.material, [...(byMaterial.get(mesh.material) ?? []), mesh]);
+				for (const [material, same] of byMaterial) {
+					if (same.length < 2) continue;
+					const geometry = mergeGeometries(
+						same.map((mesh) => {
+							mesh.updateMatrix();
+							return mesh.geometry.clone().applyMatrix4(mesh.matrix);
+						}),
+					);
+					if (!geometry) continue; // parts that can't be merged stay as they are
+					group.remove(...same);
+					group.add(new THREE.Mesh(geometry, material));
+				}
+			}
+
 			// Something you can grab (it has a body) and/or click.
 			const interactives = []; // { object, body?, onClick? }
 			const clickTarget = (radius) => new THREE.Mesh(new THREE.SphereGeometry(radius, 8, 6), new THREE.MeshBasicMaterial({ visible: false }));
 
 			// =====================================================================
 			// Flames
-			// Each flame can be clicked out. Once out it stays out and its wick
-			// keeps giving off a thin thread of smoke.
+			// Each flame can be clicked out. Its wick then gives off a thin thread
+			// of smoke, and 6 to 10 seconds later the smoke catches a little way
+			// up: a flame runs down it, like lighting a just-blown-out candle's
+			// smoke with a match, and the wick flares back up.
 			// =====================================================================
 
-			const flames = []; // { mesh, material, on, lit, wax? }
-			const pumpkinFlame = { mesh: flame, material: flameMaterial, on: true, lit: 1 };
+			const flames = []; // { mesh, material, on, lit, size, wax? }
+			const pumpkinFlame = { mesh: flame, material: flameMaterial, on: true, lit: 1, size: 1 };
 			flames.push(pumpkinFlame);
 
 			function addFlame(parent, position, width, height, wax) {
@@ -1926,7 +1949,7 @@
 				const mesh = new THREE.Mesh(geometry, material);
 				mesh.position.copy(position);
 				parent.add(mesh);
-				const entry = { mesh, material, on: true, lit: 1, wax };
+				const entry = { mesh, material, on: true, lit: 1, size: 1, wax };
 				flames.push(entry);
 				const target = clickTarget(width * 1.3);
 				target.position.copy(position).y += height * 0.4;
@@ -1939,8 +1962,59 @@
 				if (!entry.on) return;
 				entry.on = false;
 				if (entry === pumpkinFlame) settings.candleLit = false;
+				entry.home ??= entry.mesh.position.clone();
+				entry.relightIn = 6 + Math.random() * 4;
+				entry.relight = undefined; // it can be put out again while it's still catching
+				entry.size = 1;
+				entry.mesh.position.copy(entry.home);
 				smokeEmitters.push({ flame: entry, age: 0, carry: 0 });
 				sounds.puff(entry.mesh.getWorldPosition(new THREE.Vector3()));
+			}
+
+			const RELIGHT_RUN = 0.45; // seconds the flame takes to run down the smoke
+			const relightWick = new THREE.Vector3();
+			const relightTop = new THREE.Vector3();
+
+			// Counts down while the flame's out; then the smoke catches and the
+			// flame runs down it (small, and eating the smoke it passes), and
+			// flares as the wick takes it.
+			function updateRelight(entry, dt) {
+				if (!entry.on && entry.relightIn !== undefined && (entry.relightIn -= dt) <= 0) {
+					entry.on = true;
+					if (entry === pumpkinFlame) settings.candleLit = true;
+					entry.relightIn = undefined;
+					entry.relight = 0;
+					const emitter = smokeEmitters.findIndex((emitter) => emitter.flame === entry);
+					if (emitter >= 0) smokeEmitters.splice(emitter, 1);
+					sounds.ignite(entry.mesh.getWorldPosition(new THREE.Vector3()));
+				}
+				if (entry.relight === undefined) return;
+				const s = (entry.relight += dt);
+				const catchHeight = 3.5 * entry.mesh.geometry.parameters.height;
+				if (s < RELIGHT_RUN) {
+					entry.mesh.position.y = entry.home.y + catchHeight * (1 - (s / RELIGHT_RUN) ** 1.5);
+					entry.size = 0.6;
+					// Burn away the smoke between the flame and where it caught; the
+					// smoke above that keeps rising.
+					entry.mesh.parent.localToWorld(relightWick.copy(entry.home));
+					entry.mesh.parent.localToWorld(relightTop.copy(entry.home).setY(entry.home.y + catchHeight));
+					const front = entry.mesh.getWorldPosition(_v).y;
+					for (let i = 0; i < SMOKE_MAX; i++) {
+						const x = smokePositions[i * 3] - relightWick.x;
+						const y = smokePositions[i * 3 + 1];
+						const z = smokePositions[i * 3 + 2] - relightWick.z;
+						if (x * x + z * z < 0.015 && y > front - 0.02 && y < relightTop.y + 0.03) smoke[i].age = smoke[i].life;
+					}
+				} else {
+					const k = s - RELIGHT_RUN;
+					const take = 1 - Math.exp(-k * 20);
+					entry.mesh.position.y = entry.home.y;
+					entry.size = 0.6 + 0.4 * take + 0.45 * take * Math.exp(-k * 3);
+					if (k > 1.5) {
+						entry.size = 1;
+						entry.relight = undefined;
+					}
+				}
 			}
 
 			const pumpkinFlameTarget = clickTarget(0.06);
@@ -2118,6 +2192,7 @@
 			clusterLight.castShadow = true;
 			clusterLight.shadow.mapSize.set(512, 512);
 			clusterLight.shadow.camera.near = 0.1;
+			clusterLight.shadow.camera.far = 14; // the table and the ground under it; not the piano or the stones far off
 			clusterLight.shadow.bias = -0.004;
 			scene.add(clusterLight);
 
@@ -2451,6 +2526,7 @@
 				const toothGeometries = TOOTH_KINDS.map(buildTooth);
 				const missing = new Set([randInt(3, 7), 8 + randInt(4, 7), 16 + randInt(0, 7)]);
 				let n = 0;
+				const teeth = { upper: [], lower: [] };
 				for (const upper of [true, false]) {
 					for (const side of [-1, 1]) {
 						for (let i = 0; i < 8; i++, n++) {
@@ -2467,9 +2543,12 @@
 								tooth.position.set(x, -0.475, z - 0.012).sub(JAW_HINGE);
 								jaw.add(tooth);
 							}
+							teeth[upper ? "upper" : "lower"].push(tooth);
 						}
 					}
 				}
+				mergeParts(skull, teeth.upper);
+				mergeParts(jaw, teeth.lower);
 				skull.userData.jaw = jaw;
 				return skull;
 			}
@@ -2735,6 +2814,7 @@
 				lace.wrapS = lace.wrapT = THREE.RepeatWrapping;
 				lace.repeat.set(3, 3);
 				const cloth = new THREE.MeshStandardMaterial({ map: lace, roughness: 0.95, side: THREE.DoubleSide });
+				const leather = new THREE.MeshStandardMaterial({ color: "#1c1714", roughness: 0.6 });
 
 				// Seated body: dress with a ruffled hem, legs out in front.
 				const skirt = displace(
@@ -2763,7 +2843,7 @@
 					const leg = new THREE.Mesh(new THREE.CapsuleGeometry(0.06, 0.3, 4, 10), limbPorcelain);
 					leg.position.set(side * 0.11, 0.08, 0.3);
 					leg.rotation.set(Math.PI / 2 - 0.15, side * 0.12, 0);
-					const shoe = new THREE.Mesh(new THREE.SphereGeometry(0.075, 12, 8).scale(1, 0.8, 1.3), new THREE.MeshStandardMaterial({ color: "#1c1714", roughness: 0.6 }));
+					const shoe = new THREE.Mesh(new THREE.SphereGeometry(0.075, 12, 8).scale(1, 0.8, 1.3), leather);
 					shoe.position.set(side * 0.13, 0.08, 0.52);
 					doll.add(arm, hand, leg, shoe);
 				}
@@ -2812,6 +2892,11 @@
 				);
 				bonnet.position.set(0, 0.27, -0.03);
 				head.add(bonnet);
+				mergeParts(doll, [...doll.children]); // the whole seated body
+				mergeParts(
+					head,
+					head.children.filter((part) => !eyes.includes(part)), // all but the lids, which blink
+				);
 				doll.add(head);
 				doll.userData = { head, eyes, blink: 0 };
 				return doll;
@@ -3379,10 +3464,12 @@
 				});
 			{
 				const { width, height, depth } = DRAWER;
+				const box = [];
 				const part = (w, h, d, x, y, z) => {
 					const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), frameMaterial);
 					mesh.position.set(x, y, z);
 					drawer.add(mesh);
+					box.push(mesh);
 					world.createCollider(RAPIER.ColliderDesc.cuboid(w / 2, h / 2, d / 2).setTranslation(x, y, z), drawerBody);
 				};
 				part(width - 0.03, height - 0.02, 0.07, 0, 0, 0); // front
@@ -3397,6 +3484,7 @@
 				ring.position.set(0, -0.01, 0.05);
 				ring.rotation.x = -0.25;
 				drawer.add(plate, ring);
+				mergeParts(drawer, [...box, plate, ring]);
 
 				const floor = -height / 2 + 0.031;
 				// Placed toward the middle, where you can see in past the front.
@@ -3669,12 +3757,14 @@
 				let clusterLit = 0;
 				for (const entry of flames) {
 					entry.lit += ((entry.on ? 1 : 0) - entry.lit) * Math.min(1, dt * 6);
+					updateRelight(entry, dt);
 					if (entry === pumpkinFlame) continue;
-					const level = entry.lit * (0.92 + 0.06 * Math.sin(t * 7 + entry.material.uniforms.uPhase.value) + 0.04 * flicker);
+					const size = entry.lit * entry.size;
+					const level = size * (0.92 + 0.06 * Math.sin(t * 7 + entry.material.uniforms.uPhase.value) + 0.04 * flicker);
 					entry.material.uniforms.uTime.value = t;
 					entry.material.uniforms.uSway.value = 0.1 * Math.sin(t * 1.1 + entry.material.uniforms.uPhase.value) + gust * gustSide;
 					entry.mesh.visible = entry.lit > 0.01;
-					entry.mesh.scale.set(entry.lit, (0.85 + 0.2 * level) * entry.lit, entry.lit);
+					entry.mesh.scale.set(size, (0.85 + 0.2 * level) * size, size);
 					entry.mesh.getWorldPosition(_v);
 					entry.mesh.rotation.y = Math.atan2(camera.position.x - _v.x, camera.position.z - _v.z) - entry.mesh.parent.rotation.y;
 					entry.wax.userData.level.value = level;
@@ -6399,6 +6489,13 @@
 					});
 				}
 
+				// The smoke catching: a soft, low whump.
+				function ignite(position) {
+					if (!ctx) return;
+					burst({ position, filter: "lowpass", frequency: 700, peak: 0.5, attack: 0.03, decay: 0.4, wet: 0.25, ref: 2 });
+					burst({ position, filter: "bandpass", frequency: 2600, q: 0.7, peak: 0.08, attack: 0.08, decay: 0.5, wet: 0.3, ref: 2 });
+				}
+
 				function puff(position) {
 					if (!ctx) return;
 					burst({ position, filter: "bandpass", frequency: 1100, q: 0.8, peak: 0.6, attack: 0.02, decay: 0.35, wet: 0.2, ref: 2 });
@@ -6650,6 +6747,7 @@
 					start,
 					update,
 					puff,
+					ignite,
 					impact,
 					musicBox,
 					witchPasses,
@@ -6678,23 +6776,45 @@
 			const SPEAKER = '<path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/>';
 			const WAVES = '<path d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>';
 			const CROSS = '<path d="M16.5 9.5l5 5m0-5l-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>';
+			// A thin circle with the speaker in it, as faint and as white as the
+			// maker's mark (whose link is 25% and its text 60% of that), and like
+			// it, brighter under the pointer.
+			const soundStyles = document.createElement("style");
+			soundStyles.textContent = `
+				/* How far the mute button and the maker's mark sit from their corners. */
+				:root {
+					--edge: 15px;
+				}
+				@media (min-width: 768px) {
+					:root {
+						--edge: 30px;
+					}
+				}
+				.sound-button {
+					position: fixed;
+					top: max(var(--edge), env(safe-area-inset-top));
+					right: max(var(--edge), env(safe-area-inset-right));
+					width: 42px;
+					height: 42px;
+					padding: 0;
+					display: grid;
+					place-items: center;
+					border-radius: 50%;
+					border: 1px solid currentColor;
+					background: none;
+					color: #f6f6f6;
+					cursor: pointer;
+					opacity: 0.15;
+					transition: opacity 0.2s;
+				}
+				.sound-button:hover,
+				.sound-button:focus-visible {
+					opacity: 0.42;
+				}
+			`;
+			document.head.appendChild(soundStyles);
 			const soundButton = document.createElement("button");
-			Object.assign(soundButton.style, {
-				position: "fixed",
-				top: "14px",
-				right: "14px",
-				width: "42px",
-				height: "42px",
-				padding: "0",
-				display: "grid",
-				placeItems: "center",
-				borderRadius: "50%",
-				border: "1px solid rgba(255, 190, 120, 0.25)",
-				background: "rgba(12, 10, 8, 0.55)",
-				color: "#e8d2b0",
-				cursor: "pointer",
-				backdropFilter: "blur(4px)",
-			});
+			soundButton.className = "sound-button";
 			function updateSoundButton() {
 				const on = sounds.playing();
 				// The drawing spans x 4 to about 22, so shift the view box to center it.
@@ -7301,14 +7421,13 @@
 			for (const type of ["pointerdown", "wheel", "keydown"]) addEventListener(type, dismissGuide, { capture: true });
 
 			// =====================================================================
-			// Maker's mark, carved under the table and in the corner, and the
-			// frame rate
+			// Maker's mark, carved under the table and in the corner
 			// The mark from the footer of hemm.ing is cut into the underside of
 			// the board beneath the pumpkin. Tip the camera down below the table
 			// and look up to find it, by the light of a candle stub somebody left
 			// on the ground. Hover and it's underlined; click it to open Parker
-			// Hemming's portfolio in a new tab. It's also in the bottom right,
-			// faintly, as a plain link.
+			// Hemming's portfolio in a new tab. It's also at the top in the
+			// middle, faintly, as a plain link.
 			// How it's cut: the lettering is drawn into a height map, deepest along
 			// the middle of each stroke the way a V-chisel leaves it, and that
 			// pushes a finely divided patch of the board up into the wood. The
@@ -7316,7 +7435,6 @@
 			// rougher down in the cuts and worn paler along their edges, and the
 			// board's underside is opened up where the patch goes, so you're
 			// looking into real grooves.
-			// A faint frame rate, bottom left.
 			// =====================================================================
 
 			const allura = document.createElement("link"); // just the two letters of the "an"
@@ -7516,6 +7634,10 @@
 			markPatch.visible = false;
 			markPatch.receiveShadow = true;
 			markBoard.add(markPatch);
+			// The boards block clicks, but what's painted or carved on them
+			// mustn't: it would get in the way of clicking the mark.
+			const unclickable = () => {};
+			markPatch.raycast = unclickable;
 
 			// A bloody handprint off to the right of the lettering, on the board in
 			// front of it, at an angle with its runs spilling back across the gap,
@@ -7720,6 +7842,7 @@
 				geometry.computeVertexNormals();
 				const print = new THREE.Mesh(geometry, handMaterial);
 				print.receiveShadow = true;
+				print.raycast = unclickable;
 				board.add(print);
 				return [print];
 			});
@@ -7741,6 +7864,7 @@
 				if (!under) continue; // it ended over the gap
 				const drop = new THREE.Mesh(lathe(profile, 10), dropMaterial);
 				drop.position.copy(under[1]).y -= 0.001;
+				drop.raycast = unclickable;
 				under[0].add(drop);
 			}
 
@@ -7801,8 +7925,8 @@
 			cornerStyles.textContent = `
 				.maker-mark {
 					position: fixed;
-					right: max(18px, env(safe-area-inset-right));
-					bottom: max(12px, env(safe-area-inset-bottom));
+					top: max(var(--edge), env(safe-area-inset-top));
+					left: max(var(--edge), env(safe-area-inset-left));
 					display: inline-block;
 					text-decoration: none;
 					opacity: 0.25;
@@ -7823,6 +7947,7 @@
 					text-align: center;
 					opacity: 0.6;
 					transform: scaleX(1.15) scaleY(0.9);
+					transform-origin: top left; /* so its letters start where its box does, the same distance from the corner as the mute button */
 				}
 				.maker-mark__symbols {
 					position: absolute;
@@ -7841,20 +7966,10 @@
 					font: italic 400 14px "Allura", cursive;
 					transform: scaleX(1) scaleY(1.5) translateY(-1px) rotate(-2.25deg);
 				}
-				.frame-rate {
-					position: fixed;
-					left: max(16px, env(safe-area-inset-left));
-					bottom: max(14px, env(safe-area-inset-bottom));
-					color: #e8d8bf;
-					font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
-					letter-spacing: 0.5px;
-					opacity: 0.35;
-					pointer-events: none;
-				}
 			`;
 			document.head.appendChild(cornerStyles);
 
-			// The mark from the footer of hemm.ing again, faintly, bottom right.
+			// The mark from the footer of hemm.ing again, faintly, top left.
 			const mark = document.createElement("a");
 			mark.className = "maker-mark";
 			mark.href = "https://hemm.ing";
@@ -7868,20 +7983,6 @@
 				</span>
 			`;
 			document.body.appendChild(mark);
-
-			const frameRate = document.createElement("div");
-			frameRate.className = "frame-rate";
-			frameRate.setAttribute("aria-hidden", "true");
-			document.body.appendChild(frameRate);
-			const frames = { count: 0, time: 0 };
-			function updateFrameRate(rawDt) {
-				frames.count++;
-				frames.time += rawDt;
-				if (frames.time < 0.5) return; // twice a second, so it's readable
-				frameRate.textContent = `${Math.round(frames.count / frames.time)} fps`;
-				frames.count = 0;
-				frames.time = 0;
-			}
 
 			// =====================================================================
 			// Animation
@@ -7902,7 +8003,6 @@
 			function animate() {
 				const rawDt = clock.getDelta();
 				const dt = Math.min(rawDt, 0.05);
-				updateFrameRate(rawDt);
 				const t = clock.elapsedTime;
 
 				if (Math.random() < dt * 0.25) {
@@ -7916,7 +8016,8 @@
 				lit += (on - lit) * Math.min(1, dt * 6);
 				ember += (on - ember) * Math.min(1, dt * 1.2);
 
-				const level = flicker * (1 - gust) * (1 + 0.03 * Math.sin(t * 9.1) + 0.02 * Math.sin(t * 15.7 + 1.3)) * lit;
+				const size = lit * pumpkinFlame.size;
+				const level = flicker * (1 - gust) * (1 + 0.03 * Math.sin(t * 9.1) + 0.02 * Math.sin(t * 15.7 + 1.3)) * size;
 				const sway = 0.15 * Math.sin(t * 1.3) * Math.sin(t * 0.7 + 1) + gust * gustSide * 2.5;
 				candleLight.intensity = CANDLE_INTENSITY * level;
 				bounceLight.intensity = BOUNCE_INTENSITY * level;
@@ -7927,7 +8028,7 @@
 				flameMaterial.uniforms.uTime.value = t;
 				flameMaterial.uniforms.uSway.value = sway;
 				flame.visible = glow.visible = lit > 0.01;
-				flame.scale.set(lit, (0.85 + 0.25 * level) * lit, lit);
+				flame.scale.set(size, (0.85 + 0.25 * level) * size, size);
 				glow.material.opacity = 0.5 * level;
 
 				// Turn the flame to face the camera, staying upright.
